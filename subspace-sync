@@ -6,7 +6,7 @@ BIN_DIR="$SUBSPACE_DIR"
 
 
 if [ "$EUID" -ne 0 ]; then
-    echo "This command requires superuser privileges."
+    echo "Synchronizing subspaces requires superuser privileges."
     exit 1
 fi
 
