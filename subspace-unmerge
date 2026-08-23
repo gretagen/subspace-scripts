@@ -1,0 +1,273 @@
+#!/bin/bash
+set -euo pipefail
+
+# subspace-unmerge — remove packages previously merged from a subspace onto the host
+#
+# Usage:
+#   subspace-unmerge <distro> <package>  # remove a merged package
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: subspace-unmerge requires root privileges." >&2
+    exit 1
+fi
+
+SUBSPACE_DIR="/subspace"
+PASS=0
+
+usage() {
+    cat <<'EOF'
+Usage: subspace-unmerge [options] <distro> <package>
+
+Remove a package previously merged from a subspace onto the host system.
+The distro's native package manager is invoked via the subspace's own
+dynamic linker to ensure library compatibility.
+
+Options:
+  --pass      Skip confirmation prompts (for declarative use)
+
+Supported distros: arch, debian, fedora, opensuse, gentoo
+Musl distros (alpine) cannot be merged.
+EOF
+}
+
+confirm() {
+    if [ "$PASS" -eq 1 ]; then return 0; fi
+    read -rp "$1 [y/N]: " answer
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+# --- Run PM binary via subspace's dynamic linker ---
+
+run_pm() {
+    local root="$1"
+    shift
+
+    local ld=""
+    for path in \
+        "$root/lib64/ld-linux-x86-64.so.2" \
+        "$root/lib/ld-linux-x86-64.so.2" \
+        "$root/lib/ld-linux.so.2" \
+        "$root/lib64/ld-linux-aarch64.so.1" \
+        "$root/lib/ld-linux-aarch64.so.1"; do
+        if [ -x "$path" ] 2>/dev/null; then
+            ld="$path"
+            break
+        fi
+    done
+
+    if [ -n "$ld" ]; then
+        "$ld" \
+            --library-path "$root/usr/lib64:$root/usr/lib:$root/lib64:$root/lib" \
+            "$@"
+    else
+        exec "$@"
+    fi
+}
+
+# --- PM configuration per distro ---
+
+get_pm_config() {
+    local distro="$1"
+    local root="$SUBSPACE_DIR/$distro"
+
+    PM_ROOT="$root"
+
+    case "$distro" in
+        arch)
+            PM_BIN="$root/usr/bin/pacman"
+            PM_REMOVE=(-Rns --noconfirm)
+            PM_CONFIG=(--root / --dbpath "$root/var/lib/pacman" --config "$root/etc/pacman.conf")
+            ;;
+        debian)
+            PM_BIN="$root/usr/bin/apt-get"
+            PM_REMOVE=(remove -y)
+            PM_CONFIG=(-o "Dir=/" -o "Dir::Etc::sourcelist=$root/etc/apt/sources.list" -o "Dir::Etc::sourceparts=/dev/null" -o "APT::Get::List-Cleanup=0")
+            ;;
+        fedora)
+            PM_BIN="$root/usr/bin/dnf"
+            PM_REMOVE=(remove -y)
+            PM_CONFIG=(--installroot=/ --setopt="reposdir=$root/etc/yum.repos.d")
+            ;;
+        opensuse)
+            PM_BIN="$root/usr/bin/zypper"
+            PM_REMOVE=(rm -y)
+            PM_CONFIG=(--root / --reposd-dir "$root/etc/zypp/repos.d")
+            ;;
+        gentoo)
+            PM_BIN="$root/usr/bin/emerge"
+            PM_REMOVE=(--deselect)
+            PM_CONFIG=()
+            export PORTAGE_CONFIGROOT="$root"
+            export ROOT="/"
+            ;;
+        *)
+            echo "Error: unsupported distro '$distro'" >&2
+            echo "Supported: arch, debian, fedora, opensuse, gentoo" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# --- Validate distro ---
+
+validate_distro() {
+    local distro="$1"
+    case "$distro" in
+        arch|debian|fedora|opensuse|gentoo|void) return 0 ;;
+        alpine)
+            echo "Error: cannot unmerge '$distro' — musl distro incompatible with glibc host." >&2
+            exit 1
+            ;;
+        *)
+            echo "Error: unknown distro '$distro'." >&2
+            echo "Supported: arch, debian, fedora, opensuse, gentoo" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# --- Execute PM remove ---
+
+pm_remove() {
+    local pkg="$1"
+    get_pm_config "$REPO_DISTRO"
+
+    run_pm "$PM_ROOT" "$PM_BIN" "${PM_CONFIG[@]}" "${PM_REMOVE[@]}" "$pkg"
+}
+
+# --- Remove a merged package ---
+
+cmd_remove() {
+    local distro="$1"
+    local pkg="$2"
+
+    validate_distro "$distro"
+
+    if [ ! -d "$SUBSPACE_DIR/$distro/usr" ]; then
+        echo "Error: '$distro' subspace not installed." >&2
+        exit 1
+    fi
+
+    if ! confirm "Remove $pkg from host (via $distro)?"; then
+        echo "Cancelled."
+        exit 0
+    fi
+
+    echo "Removing $pkg from host (via $distro)..."
+    REPO_DISTRO="$distro" pm_remove "$pkg"
+    echo "Done: $pkg removed."
+    manifest_remove "$distro" "$pkg"
+    run_post_merge_hooks
+}
+
+# --- Manifest management ---
+
+MANIFEST_DIR="/var/db"
+
+# Add a package to the merged manifest
+manifest_add() {
+    local distro="$1"
+    local pkg="$2"
+    local manifest="$MANIFEST_DIR/merged-$distro"
+
+    mkdir -p "$MANIFEST_DIR"
+    # Only add if not already present
+    if ! grep -qx "$pkg" "$manifest" 2>/dev/null; then
+        echo "$pkg" >> "$manifest"
+    fi
+}
+
+# Remove a package from the merged manifest
+manifest_remove() {
+    local distro="$1"
+    local pkg="$2"
+    local manifest="$MANIFEST_DIR/merged-$distro"
+
+    if [ -f "$manifest" ]; then
+        grep -v "^${pkg}$" "$manifest" > "$manifest.tmp" 2>/dev/null || true
+        mv "$manifest.tmp" "$manifest"
+    fi
+}
+
+# --- Post-merge hooks ---
+
+run_post_merge_hooks() {
+    echo "Running post-merge system updates..."
+
+    if command -v ldconfig &>/dev/null; then
+        ldconfig >/dev/null 2>&1 || true
+    fi
+
+    if command -v update-desktop-database &>/dev/null; then
+        echo "  update-desktop-database"
+        update-desktop-database -q /usr/share/applications 2>/dev/null || true
+        local home_dir
+        for home_dir in /home/*/; do
+            [ -d "${home_dir}.local/share/applications" ] && \
+                update-desktop-database -q "${home_dir}.local/share/applications" 2>/dev/null || true
+        done
+    fi
+
+    if command -v gtk-update-icon-cache &>/dev/null; then
+        echo "  gtk-update-icon-cache"
+        gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+        gtk-update-icon-cache -f -t /usr/share/icons/gnome 2>/dev/null || true
+    elif command -v gtk-update-icon-cache-3.0 &>/dev/null; then
+        echo "  gtk-update-icon-cache-3.0"
+        gtk-update-icon-cache-3.0 -f -t /usr/share/icons/hicolor 2>/dev/null || true
+    fi
+
+    if command -v update-mime-database &>/dev/null; then
+        echo "  update-mime-database"
+        update-mime-database /usr/share/mime 2>/dev/null || true
+    fi
+
+    if command -v fc-cache &>/dev/null; then
+        echo "  fc-cache"
+        fc-cache -f 2>/dev/null || true
+    fi
+
+    if command -v glib-compile-schemas &>/dev/null && [ -d /usr/share/glib-2.0/schemas ]; then
+        echo "  glib-compile-schemas"
+        glib-compile-schemas /usr/share/glib-2.0/schemas 2>/dev/null || true
+    fi
+
+    echo "Post-merge hooks complete."
+}
+
+# --- Main ---
+
+# Parse --pass from anywhere in args
+for arg in "$@"; do
+    [ "$arg" = "--pass" ] && PASS=1
+done
+# Remove --pass from args so the rest of the parser doesn't see it
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --pass) ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+if [ $# -lt 2 ]; then
+    usage
+    exit 0
+fi
+
+case "$1" in
+    --help|-h)
+        usage
+        ;;
+    -*)
+        echo "Error: unknown option '$1'" >&2
+        usage
+        exit 1
+        ;;
+    *)
+        distro="$1"
+        pkg="$2"
+        cmd_remove "$distro" "$pkg"
+        ;;
+esac

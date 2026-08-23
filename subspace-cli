@@ -1,0 +1,284 @@
+#!/bin/bash
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Managing subspaces requires superuser privileges."
+    exit 1
+fi
+
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+SUBSPACE_DIR="/subspace"
+SCRIPT_DIR="$(dirname "$0")"
+
+VALID_DISTROS="debian alpine gentoo void fedora opensuse arch"
+
+setup() {
+    mkdir -p "$SUBSPACE_DIR"
+
+    for tool in subspace-run subspace-enter subspace-sync; do
+        if [ -f "$SCRIPT_DIR/$tool" ]; then
+            cp "$SCRIPT_DIR/$tool" "$SUBSPACE_DIR/$tool"
+            chmod +x "$SUBSPACE_DIR/$tool"
+            chown "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/$tool"
+        fi
+    done
+
+    grep -q '/subspace' "$REAL_HOME/.bashrc" 2>/dev/null || \
+        echo 'export PATH="$PATH:/subspace"' >> "$REAL_HOME/.bashrc"
+}
+
+usage() {
+    echo "Usage: subspace-cli <command> [args]"
+    echo
+    echo "Commands:"
+    echo "  install <distro>    Install a subspace"
+    echo "  remove  <distro>    Remove an installed subspace"
+    echo "  list                List installed subspaces"
+    echo
+    echo "Available distros:"
+    echo "  debian, alpine, gentoo, void, fedora, opensuse, arch"
+}
+
+install_distro() {
+    local distro="$1"
+
+    if [ -d "$SUBSPACE_DIR/$distro/usr" ]; then
+        echo "Error: '$distro' is already installed."
+        exit 1
+    fi
+
+    echo "Installing $distro subspace..."
+
+    case "$distro" in
+        debian)
+            DEB_ARCH="amd64"
+            case "$(uname -m)" in
+                x86_64)  DEB_ARCH="amd64" ;;
+                aarch64) DEB_ARCH="arm64" ;;
+                armv71)  DEB_ARCH="armhf" ;;
+                i686)    DEB_ARCH="i386"  ;;
+                ppc64le) DEB_ARCH="ppc64el" ;;
+            esac
+
+            mkdir -p "$SUBSPACE_DIR/debian"
+            debootstrap --arch="$DEB_ARCH" stable "$SUBSPACE_DIR/debian" http://deb.debian.org/debian/ || \
+            debootstrap --arch="$DEB_ARCH" --variant=minbase stable "$SUBSPACE_DIR/debian" http://deb.debian.org/debian/
+
+            if [ ! -d "$SUBSPACE_DIR/debian/usr" ]; then
+                echo "ERROR: Debian subspace installation failed"
+                exit 1
+            fi
+
+            rm -rf "$SUBSPACE_DIR/debian/var/cache/apt/archives/"*
+            chown -R "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/debian"
+            echo "  > Debian subspace installed at $SUBSPACE_DIR/debian"
+            echo "  > Enter with: subspace-enter debian"
+            ;;
+
+        alpine)
+            TEMP_DIR=$(mktemp -d)
+            mkdir -p "$SUBSPACE_DIR/alpine"
+            curl -L "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.0-x86_64.tar.gz" \
+                 -o "$TEMP_DIR/alpine.tar.gz"
+            tar -xf "$TEMP_DIR/alpine.tar.gz" -C "$SUBSPACE_DIR/alpine"
+            rm -rf "$TEMP_DIR"
+
+            if [ ! -d "$SUBSPACE_DIR/alpine/usr" ]; then
+                echo "ERROR: Alpine subspace installation failed"
+                exit 1
+            fi
+
+            cp /etc/resolv.conf "$SUBSPACE_DIR/alpine/etc/resolv.conf"
+            chown -R "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/alpine"
+            echo "  > Alpine subspace installed at $SUBSPACE_DIR/alpine"
+            echo "  > Enter with: subspace-enter alpine"
+            ;;
+
+        gentoo)
+            TEMP_DIR=$(mktemp -d)
+            mkdir -p "$SUBSPACE_DIR/gentoo"
+            curl -L "https://mirrors.kernel.org/gentoo/releases/amd64/autobuilds/20260816T170110Z/stage3-amd64-desktop-openrc-20260816T170110Z.tar.xz" \
+                 -o "$TEMP_DIR/gentoo.tar.xz"
+            tar -xf "$TEMP_DIR/gentoo.tar.xz" -C "$SUBSPACE_DIR/gentoo"
+            rm -rf "$TEMP_DIR"
+
+            if [ ! -d "$SUBSPACE_DIR/gentoo/usr" ]; then
+                echo "ERROR: Gentoo subspace installation failed"
+                exit 1
+            fi
+
+            cp /etc/resolv.conf "$SUBSPACE_DIR/gentoo/etc/resolv.conf"
+            chown -R "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/gentoo"
+            echo "  > Gentoo subspace installed at $SUBSPACE_DIR/gentoo"
+            echo "  > Enter with: subspace-enter gentoo"
+            ;;
+
+        void)
+            TEMP_DIR=$(mktemp -d)
+            mkdir -p "$SUBSPACE_DIR/void"
+            curl -L "https://repo-default.voidlinux.org/live/current/void-x86_64-ROOTFS-20250202.tar.xz" \
+                 -o "$TEMP_DIR/void.tar.xz"
+            tar -xf "$TEMP_DIR/void.tar.xz" -C "$SUBSPACE_DIR/void"
+            rm -rf "$TEMP_DIR"
+
+            if [ ! -d "$SUBSPACE_DIR/void/usr" ]; then
+                echo "ERROR: Void subspace installation failed"
+                exit 1
+            fi
+
+            cp /etc/resolv.conf "$SUBSPACE_DIR/void/etc/resolv.conf"
+            chown -R "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/void"
+            subspace-run void xbps-install -y -r / -R https://repo-default.voidlinux.org/current -Su xbps 2>&1
+            echo "  > Void subspace installed at $SUBSPACE_DIR/void"
+            echo "  > Enter with: subspace-enter void"
+            ;;
+
+        fedora)
+            TEMP_DIR=$(mktemp -d)
+            mkdir -p "$SUBSPACE_DIR/fedora"
+            curl -L "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Container/x86_64/images/Fedora-Container-Base-Generic-44-1.7.x86_64.oci.tar.xz" \
+                 -o "$TEMP_DIR/fedora.tar.xz"
+            tar -xf "$TEMP_DIR/fedora.tar.xz" -C "$SUBSPACE_DIR/fedora"
+            tar -xpf "$SUBSPACE_DIR/fedora/blobs/sha256/d93cacdefe7f7526297a08879cb444d1eeb526adf9cb7e34ab1f0609759a3044" \
+                -C "$SUBSPACE_DIR/fedora" --numeric-owner
+            rm -rf "$SUBSPACE_DIR/fedora/blobs" "$SUBSPACE_DIR/fedora/index.json" "$SUBSPACE_DIR/fedora/oci-layout"
+            rm -rf "$TEMP_DIR"
+
+            if [ ! -d "$SUBSPACE_DIR/fedora/usr" ]; then
+                echo "ERROR: Fedora subspace installation failed"
+                exit 1
+            fi
+
+            cp /etc/resolv.conf "$SUBSPACE_DIR/fedora/etc/resolv.conf"
+            chown -R "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/fedora"
+            echo "  > Fedora subspace installed at $SUBSPACE_DIR/fedora"
+            echo "  > Enter with: subspace-enter fedora"
+            ;;
+
+        opensuse)
+            TEMP_DIR=$(mktemp -d)
+            mkdir -p "$SUBSPACE_DIR/opensuse"
+            curl -L "http://download.opensuse.org/tumbleweed/appliances/opensuse-tumbleweed-image.x86_64-networkd.tar.xz" \
+                 -o "$TEMP_DIR/opensuse.tar.xz"
+            tar -xf "$TEMP_DIR/opensuse.tar.xz" -C "$SUBSPACE_DIR/opensuse"
+            rm -rf "$TEMP_DIR"
+
+            if [ ! -d "$SUBSPACE_DIR/opensuse/usr" ]; then
+                echo "ERROR: Opensuse subspace installation failed"
+                exit 1
+            fi
+
+            cp /etc/resolv.conf "$SUBSPACE_DIR/opensuse/etc/resolv.conf"
+            chown -R "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/opensuse"
+            echo "  > Opensuse subspace installed at $SUBSPACE_DIR/opensuse"
+            echo "  > Enter with: subspace-enter opensuse"
+            ;;
+
+        arch)
+            TEMP_DIR=$(mktemp -d)
+            mkdir -p "$SUBSPACE_DIR/arch"
+            curl -L "https://github.com/gretagen/arch-subspace/releases/download/v1.0.0/archlinux.tar.gz" \
+                 -o "$TEMP_DIR/arch.tar.gz"
+            tar -xzf "$TEMP_DIR/arch.tar.gz" -C "$SUBSPACE_DIR/arch" --strip-components=1
+            rm -rf "$TEMP_DIR"
+
+            if [ ! -d "$SUBSPACE_DIR/arch/usr" ]; then
+                echo "ERROR: Arch Linux subspace installation failed"
+                exit 1
+            fi
+
+            cp /etc/resolv.conf "$SUBSPACE_DIR/arch/etc/resolv.conf"
+            if [ -d /etc/pacman.d/gnupg ]; then
+                mkdir -p "$SUBSPACE_DIR/arch/etc/pacman.d/gnupg"
+                cp -r /etc/pacman.d/gnupg/* "$SUBSPACE_DIR/arch/etc/pacman.d/gnupg/" 2>/dev/null || true
+            fi
+    
+            chown -R "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/arch"
+            subspace-run arch pacman --noconfirm -Syu
+            echo "  > Arch Linux subspace installed at $SUBSPACE_DIR/arch"
+            echo "  > Enter with: subspace-enter arch"
+            ;;
+    esac
+
+    find "$SUBSPACE_DIR/$distro" -type f | sed "s|$SUBSPACE_DIR/$distro||" | sort > "$SUBSPACE_DIR/$distro/.snapshot"
+
+    echo
+    echo "Updating subspace application wrappers..."
+    su - "$REAL_USER" -c "$SUBSPACE_DIR/subspace-sync"
+}
+
+remove_distro() {
+    local distro="$1"
+
+    if [ ! -d "$SUBSPACE_DIR/$distro" ]; then
+        echo "Error: '$distro' is not installed."
+        exit 1
+    fi
+
+    echo "Removing $distro subspace..."
+    rm -rf "$SUBSPACE_DIR/$distro"
+    rm -f "$SUBSPACE_DIR"/subspace-${distro}-*
+    find "$REAL_HOME/.local/share/applications" -name "subspace-${distro}-*.desktop" -delete 2>/dev/null || true
+
+    echo "Cleaning up subspace application wrappers..."
+    su - "$REAL_USER" -c "$SUBSPACE_DIR/subspace-sync" 2>/dev/null || true
+    echo "Removal complete."
+}
+
+list_subspaces() {
+    local found=0
+    for dir in "$SUBSPACE_DIR"/*/; do
+        [ -d "$dir/usr" ] || continue
+        echo "  $(basename "$dir")"
+        found=1
+    done
+    if [ "$found" -eq 0 ]; then
+        echo "  (none installed)"
+    fi
+}
+
+# --- main ---
+
+setup
+
+if [ $# -lt 1 ]; then
+    usage
+    exit 0
+fi
+
+command="$1"
+shift
+
+case "$command" in
+    install)
+        if [ $# -lt 1 ]; then
+            echo "Error: missing distro name." >&2
+            echo "Usage: subspace-cli install <distro>" >&2
+            exit 1
+        fi
+        distro="$1"
+        if ! echo "$VALID_DISTROS" | grep -qw "$distro"; then
+            echo "Error: invalid distro '$distro'." >&2
+            echo "Valid options: $VALID_DISTROS" >&2
+            exit 1
+        fi
+        install_distro "$distro"
+        ;;
+    remove)
+        if [ $# -lt 1 ]; then
+            echo "Error: missing distro name." >&2
+            echo "Usage: subspace-cli remove <distro>" >&2
+            exit 1
+        fi
+        remove_distro "$1"
+        ;;
+    list)
+        list_subspaces
+        ;;
+    *)
+        echo "Error: unknown command '$command'." >&2
+        echo
+        usage
+        exit 1
+        ;;
+esac

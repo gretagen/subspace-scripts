@@ -1,0 +1,47 @@
+#!/bin/bash
+set -euo pipefail
+
+SUBSPACE_DIR="/subspace"
+
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Entering a subspace requires superuser privileges."
+    exit 1
+fi
+
+
+if [ $# -lt 1 ]; then
+    echo "Usage: subspace-enter <subspace> [shell]" >&2
+    echo "" >&2
+    echo "Available subspaces:" >&2
+    for d in "$SUBSPACE_DIR"/*/; do
+        [ -d "$d/usr" ] && echo "  $(basename "$d")" >&2
+    done
+    exit 1
+fi
+
+subspace="$1"
+root="$SUBSPACE_DIR/$subspace"
+
+if [ ! -d "$root" ]; then
+    echo "Error: Subspace '$subspace' not found at $root" >&2
+    exit 1
+fi
+
+if [ $# -ge 2 ]; then
+    shell="$2"
+else
+    for sh in /bin/bash /bin/sh /usr/bin/bash /usr/bin/sh /sbin/sh /bin/ash /usr/bin/ash; do
+        if [ -L "$root/$sh" ] || [ -x "$root/$sh" ]; then
+            shell="$sh"
+            break
+        fi
+    done
+fi
+
+if [ -z "${shell:-}" ]; then
+    echo "Error: No shell found in $subspace" >&2
+    exit 1
+fi
+
+exec "$SUBSPACE_DIR/subspace-run" "$subspace" "$shell"

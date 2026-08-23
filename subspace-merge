@@ -1,0 +1,541 @@
+#!/bin/bash
+set -euo pipefail
+
+# subspace-merge — merge packages from subspaces onto the host system
+# by directly executing the distro's native package manager from the subspace.
+#
+# Usage:
+#   subspace-merge <distro>                # merge all declared packages
+#   subspace-merge <distro> <package>      # merge a specific package
+#   subspace-merge --list                  # list all merged packages
+#   subspace-merge --list <distro>         # list merged packages for a distro
+#   subspace-merge --pass                  # skip confirmation prompts (declarative)
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Merging packages from subspaced distros requires superuser privileges." >&2
+    exit 1
+fi
+
+SUBSPACE_DIR="/subspace"
+PASS=0
+
+usage() {
+    cat <<'EOF'
+Usage: subspace-merge [options] <distro> [package]
+
+Merge packages from a subspace onto the host system using the distro's
+native package manager. The PM binary is executed via the subspace's
+own dynamic linker to ensure library compatibility.
+
+Commands:
+  subspace-merge <distro>                Merge all declared merged-<distro> packages
+  subspace-merge <distro> <package>      Merge a specific package
+  subspace-merge --list                  List all merged packages across all distros
+  subspace-merge --list <distro>         List merged packages for a specific distro
+
+Options:
+  --pass      Skip confirmation prompts (for declarative use)
+
+Supported distros: arch, debian, fedora, opensuse, gentoo
+Musl distros (alpine) cannot be merged.
+EOF
+}
+
+confirm() {
+    if [ "$PASS" -eq 1 ]; then return 0; fi
+    read -rp "$1 [y/N]: " answer
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+# --- Run PM binary via subspace's dynamic linker ---
+# This ensures the PM finds its own shared libraries from the subspace.
+
+run_pm() {
+    local root="$1"
+    shift
+
+    # Find the subspace's dynamic linker
+    local ld=""
+    for path in \
+        "$root/lib64/ld-linux-x86-64.so.2" \
+        "$root/lib/ld-linux-x86-64.so.2" \
+        "$root/lib/ld-linux.so.2" \
+        "$root/lib64/ld-linux-aarch64.so.1" \
+        "$root/lib/ld-linux-aarch64.so.1"; do
+        if [ -x "$path" ] 2>/dev/null; then
+            ld="$path"
+            break
+        fi
+    done
+
+    if [ -n "$ld" ]; then
+        "$ld" \
+            --library-path "$root/usr/lib64:$root/usr/lib:$root/usr/lib/x86_64-linux-gnu:$root/lib64:$root/lib" \
+            "$@"
+    else
+        # Fallback: try direct execution
+        exec "$@"
+    fi
+}
+
+# --- PM configuration per distro ---
+# Each distro defines: binary, install args, remove args, list command, and config prefix args.
+
+get_pm_config() {
+    local distro="$1"
+    local root="$SUBSPACE_DIR/$distro"
+
+    PM_ROOT="$root"
+    PM_PREHOOK=""
+    PM_POSTHOOK=""
+
+    case "$distro" in
+        arch)
+            PM_BIN="merge-arch"
+            PM_INSTALL=()
+            PM_LIST=()
+            PM_CONFIG=()
+            PM_USE_BWRAP=1
+            ;;
+        debian)
+            PM_BIN="merge-debian"
+            PM_INSTALL=()
+            PM_LIST=()
+            PM_CONFIG=()
+            PM_USE_BWRAP=1
+            ;;
+        fedora)
+            PM_BIN="merge-fedora"
+            PM_INSTALL=()
+            PM_LIST=()
+            PM_CONFIG=()
+            PM_USE_BWRAP=1
+            PM_POSTHOOK='cat > "/etc/os-release" <<'"'"'EOF'"'"'
+NAME="Zerene OS"
+PRETTY_NAME="Zerene OS (Devbuild 1.1)"
+ID=zerene
+VERSION_CODENAME=mainline
+VERSION="1.0"
+HOME_URL="https://zereneos.org"
+LOGO=zerene
+EOF'
+            ;;
+        opensuse)
+            PM_BIN="merge-opensuse"
+            PM_INSTALL=()
+            PM_LIST=()
+            PM_CONFIG=()
+            PM_USE_BWRAP=1
+            ;;
+        gentoo)
+            echo "Error: gentoo merge not yet supported (requires portage tree + source compilation)." >&2
+            exit 1
+            ;;
+        void)
+            PM_BIN="merge-void"
+            PM_INSTALL=()
+            PM_LIST=()
+            PM_CONFIG=()
+            PM_USE_BWRAP=1
+            ;;
+        *)
+            echo "Error: unsupported distro '$distro'" >&2
+            echo "Supported: arch, debian, fedora, opensuse, gentoo" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# --- Validate distro ---
+
+validate_distro() {
+    local distro="$1"
+    case "$distro" in
+        arch|debian|fedora|opensuse|gentoo|void) return 0 ;;
+        alpine)
+            echo "Error: cannot merge '$distro' — musl distro incompatible with glibc host." >&2
+            exit 1
+            ;;
+        *)
+            echo "Error: unknown distro '$distro'." >&2
+            echo "Supported: arch, debian, fedora, opensuse, gentoo" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# --- Execute PM commands ---
+
+pm_install() {
+    local pkg="$1"
+    get_pm_config "$REPO_DISTRO"
+
+    if [ -n "${PM_PREHOOK:-}" ]; then
+        eval "$PM_PREHOOK"
+    fi
+
+    if [ "${PM_USE_BWRAP:-0}" -eq 1 ]; then
+        # Debian/openSUSE: use merge helper
+        "$PM_BIN" "$pkg"
+        local rc=$?
+    else
+        run_pm "$PM_ROOT" "$PM_BIN" "${PM_CONFIG[@]}" "${PM_INSTALL[@]}" "$pkg"
+        local rc=$?
+    fi
+
+    if [ -n "${PM_POSTHOOK:-}" ]; then
+        eval "$PM_POSTHOOK"
+    fi
+
+    return $rc
+}
+
+pm_list() {
+    get_pm_config "$REPO_DISTRO"
+
+    if [ "${PM_USE_BWRAP:-0}" -eq 1 ]; then
+        # Query package manager inside bwrap
+        ROOT="$PM_ROOT"
+        if [ "$REPO_DISTRO" = "arch" ]; then
+            bwrap \
+                --bind "$ROOT" / \
+                --dev-bind /dev /dev \
+                --proc /proc \
+                --ro-bind /sys /sys \
+                --ro-bind /etc/resolv.conf /etc/resolv.conf \
+                --setenv HOME /root \
+                --unshare-ipc --unshare-pid --unshare-uts \
+                /usr/bin/pacman -Qeq 2>/dev/null | sort || true
+        elif [ "$REPO_DISTRO" = "debian" ]; then
+            bwrap \
+                --bind "$ROOT" / \
+                --dev-bind /dev /dev \
+                --proc /proc \
+                --ro-bind /sys /sys \
+                --ro-bind /etc/resolv.conf /etc/resolv.conf \
+                --setenv HOME /root \
+                --unshare-ipc --unshare-pid --unshare-uts \
+                /usr/bin/dpkg --get-selections 2>/dev/null | grep -v deinstall | awk '{print $1}' || true
+        elif [ "$REPO_DISTRO" = "opensuse" ]; then
+            bwrap \
+                --bind "$ROOT" / \
+                --dev-bind /dev /dev \
+                --proc /proc \
+                --ro-bind /sys /sys \
+                --ro-bind /etc/resolv.conf /etc/resolv.conf \
+                --setenv HOME /root \
+                --unshare-ipc --unshare-pid --unshare-uts \
+                /usr/bin/rpm -qa --qf '%{NAME}\n' 2>/dev/null | sort || true
+        elif [ "$REPO_DISTRO" = "void" ]; then
+            bwrap \
+                --bind "$ROOT" / \
+                --dev-bind /dev /dev \
+                --proc /proc \
+                --ro-bind /sys /sys \
+                --ro-bind /etc/resolv.conf /etc/resolv.conf \
+                --setenv HOME /root \
+                --unshare-ipc --unshare-pid --unshare-uts \
+                /usr/bin/xbps-query -m 2>/dev/null | awk '{print $1}' | sort || true
+        elif [ "$REPO_DISTRO" = "fedora" ]; then
+            bwrap \
+                --bind "$ROOT" / \
+                --dev-bind /dev /dev \
+                --proc /proc \
+                --ro-bind /sys /sys \
+                --ro-bind /etc/resolv.conf /etc/resolv.conf \
+                --setenv HOME /root \
+                --unshare-ipc --unshare-pid --unshare-uts \
+                /usr/bin/dnf repoquery --userinstalled --qf '%{name}\n' 2>/dev/null | sort || true
+        fi
+    else
+        if [ -n "${PM_PREHOOK:-}" ]; then
+            eval "$PM_PREHOOK"
+        fi
+
+        if [ "$REPO_DISTRO" = "gentoo" ]; then
+            run_pm "$PM_ROOT" "$PM_BIN" "${PM_LIST[@]}" 2>/dev/null || true
+        else
+            run_pm "$PM_ROOT" "$PM_BIN" "${PM_CONFIG[@]}" "${PM_LIST[@]}" 2>/dev/null || true
+        fi
+
+        local rc=$?
+
+        if [ -n "${PM_POSTHOOK:-}" ]; then
+            eval "$PM_POSTHOOK"
+        fi
+
+        return $rc
+    fi
+}
+
+# --- List merged packages ---
+
+cmd_list() {
+    local distro="${1:-}"
+
+    if [ -n "$distro" ]; then
+        validate_distro "$distro"
+        if [ ! -d "$SUBSPACE_DIR/$distro/usr" ]; then
+            echo "Error: '$distro' subspace not installed." >&2
+            exit 1
+        fi
+        echo "Merged packages from $distro:"
+        REPO_DISTRO="$distro" pm_list || echo "  (none)"
+    else
+        echo "Merged packages across all distros:"
+        for dir in "$SUBSPACE_DIR"/*/; do
+            [ -d "$dir/usr" ] || continue
+            local d
+            d=$(basename "$dir")
+            case "$d" in alpine) continue ;; esac
+            local pkgs
+            pkgs=$(REPO_DISTRO="$d" pm_list 2>/dev/null || true)
+            if [ -n "$pkgs" ]; then
+                echo ""
+                echo "  $d:"
+                echo "$pkgs" | sed 's/^/    /'
+            fi
+        done
+    fi
+}
+
+# --- Merge a single package ---
+
+merge_package() {
+    local distro="$1"
+    local pkg="$2"
+
+    REPO_DISTRO="$distro"
+
+    echo "  Installing $pkg via $distro..."
+    if pm_install "$pkg"; then
+        return 0
+    else
+        echo "  Error: failed to install $pkg from $distro." >&2
+        return 1
+    fi
+}
+
+# --- Merge all declared packages for a distro ---
+
+cmd_merge_distro() {
+    local distro="$1"
+
+    validate_distro "$distro"
+
+    if [ ! -d "$SUBSPACE_DIR/$distro/usr" ]; then
+        echo "Error: '$distro' subspace not installed." >&2
+        exit 1
+    fi
+
+    # Read the definition.lua to find merged-<distro> packages
+    local config_path="/etc/zerene/definition.lua"
+    if [ ! -f "$config_path" ]; then
+        echo "Error: $config_path not found." >&2
+        exit 1
+    fi
+
+    # Extract merged-<distro> packages from the Lua config
+    local key="merged-${distro}"
+    local pkgs
+    pkgs=$(lua -e "
+        local cfg = dofile('$config_path')
+        local pkgs = cfg['$key']
+        if pkgs then
+            for _, p in ipairs(pkgs) do print(p) end
+        end
+    " 2>/dev/null || true)
+
+    if [ -z "$pkgs" ]; then
+        echo "No packages declared for merged-$distro."
+        return 0
+    fi
+
+    if ! confirm "Merge all declared packages from $distro onto host?"; then
+        echo "Cancelled."
+        exit 0
+    fi
+
+    echo "Merging packages from $distro onto host..."
+    echo ""
+
+    local count=0
+    local failed=0
+    while IFS= read -r pkg; do
+        [ -z "$pkg" ] && continue
+        if merge_package "$distro" "$pkg"; then
+            manifest_add "$distro" "$pkg"
+            count=$((count + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done <<< "$pkgs"
+
+    echo ""
+    if [ "$failed" -gt 0 ]; then
+        echo "Done: $count merged, $failed failed."
+    else
+        echo "Done: $count package(s) merged from $distro."
+    fi
+}
+
+# --- Merge a specific package (ad-hoc) ---
+
+cmd_merge_package() {
+    local distro="$1"
+    local pkg="$2"
+
+    validate_distro "$distro"
+
+    if [ ! -d "$SUBSPACE_DIR/$distro/usr" ]; then
+        echo "Error: '$distro' subspace not installed." >&2
+        exit 1
+    fi
+
+    if ! confirm "Merge $pkg from $distro onto host?"; then
+        echo "Cancelled."
+        exit 0
+    fi
+
+    echo "Merging $pkg from $distro onto host..."
+    echo ""
+
+    # Create pre-merge generation
+    echo "Creating pre-merge generation..."
+    if ! genzee create "pre-merge $distro $pkg"; then
+        echo "Error: could not create rollback generation. Aborting." >&2
+        exit 1
+    fi
+
+    if merge_package "$distro" "$pkg"; then
+        echo ""
+        echo "Done: $pkg merged from $distro."
+        manifest_add "$distro" "$pkg"
+        run_post_merge_hooks
+    else
+        echo ""
+        echo "Merge failed. To revert, run: genzee rollback" >&2
+        exit 1
+    fi
+}
+
+# --- Manifest management ---
+
+MANIFEST_DIR="/var/db"
+
+# Add a package to the merged manifest
+manifest_add() {
+    local distro="$1"
+    local pkg="$2"
+    local manifest="$MANIFEST_DIR/merged-$distro"
+
+    mkdir -p "$MANIFEST_DIR"
+    # Only add if not already present
+    if ! grep -qx "$pkg" "$manifest" 2>/dev/null; then
+        echo "$pkg" >> "$manifest"
+    fi
+}
+
+# Remove a package from the merged manifest
+manifest_remove() {
+    local distro="$1"
+    local pkg="$2"
+    local manifest="$MANIFEST_DIR/merged-$distro"
+
+    if [ -f "$manifest" ]; then
+        grep -v "^${pkg}$" "$manifest" > "$manifest.tmp" 2>/dev/null || true
+        mv "$manifest.tmp" "$manifest"
+    fi
+}
+
+# --- Post-merge hooks ---
+
+run_post_merge_hooks() {
+    echo "Running post-merge system updates..."
+
+    if command -v update-desktop-database &>/dev/null; then
+        echo "  update-desktop-database"
+        update-desktop-database -q /usr/share/applications 2>/dev/null || true
+        local home_dir
+        for home_dir in /home/*/; do
+            [ -d "${home_dir}.local/share/applications" ] && \
+                update-desktop-database -q "${home_dir}.local/share/applications" 2>/dev/null || true
+        done
+    fi
+
+    if command -v gtk-update-icon-cache &>/dev/null; then
+        echo "  gtk-update-icon-cache"
+        gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+        gtk-update-icon-cache -f -t /usr/share/icons/gnome 2>/dev/null || true
+    elif command -v gtk-update-icon-cache-3.0 &>/dev/null; then
+        echo "  gtk-update-icon-cache-3.0"
+        gtk-update-icon-cache-3.0 -f -t /usr/share/icons/hicolor 2>/dev/null || true
+    fi
+
+    if command -v update-mime-database &>/dev/null; then
+        echo "  update-mime-database"
+        update-mime-database /usr/share/mime 2>/dev/null || true
+    fi
+
+    if command -v fc-cache &>/dev/null; then
+        echo "  fc-cache"
+        fc-cache -f 2>/dev/null || true
+    fi
+
+    if command -v glib-compile-schemas &>/dev/null && [ -d /usr/share/glib-2.0/schemas ]; then
+        echo "  glib-compile-schemas"
+        glib-compile-schemas /usr/share/glib-2.0/schemas 2>/dev/null || true
+    fi
+
+    echo "Post-merge hooks complete."
+}
+
+# --- Main ---
+
+# Parse --pass from anywhere in args
+for arg in "$@"; do
+    [ "$arg" = "--pass" ] && PASS=1
+done
+# Remove --pass from args so the rest of the parser doesn't see it
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --pass) ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+if [ $# -lt 1 ]; then
+    usage
+    exit 0
+fi
+
+case "$1" in
+    --list|-l)
+        shift
+        cmd_list "${1:-}"
+        ;;
+    --help|-h)
+        usage
+        ;;
+    -*)
+        echo "Error: unknown option '$1'" >&2
+        usage
+        exit 1
+        ;;
+    *)
+        distro="$1"
+        shift
+
+        validate_distro "$distro"
+
+        if [ $# -ge 1 ]; then
+            # Merge specific package
+            cmd_merge_package "$distro" "$1"
+        else
+            # Merge all declared packages for this distro
+            cmd_merge_distro "$distro"
+        fi
+        ;;
+esac

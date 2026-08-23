@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SUBSPACE_DIR="/subspace"
+BIN_DIR="$SUBSPACE_DIR"
+
+
+if [ "$EUID" -ne 0 ]; then
+    echo "This command requires superuser privileges."
+    exit 1
+fi
+
+
+if [ -n "${SUDO_USER:-}" ]; then
+    REAL_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+else
+    REAL_HOME="${HOME:-/root}"
+fi
+DESKTOP_DIR="$REAL_HOME/.local/share/applications"
+MANIFEST="$SUBSPACE_DIR/.manifest"
+
+mkdir -p "$DESKTOP_DIR" "$(dirname "$MANIFEST")"
+
+if [ -f "$MANIFEST" ]; then
+    while IFS= read -r file; do rm -f "$file"; done < "$MANIFEST"
+fi
+
+rm -f "$BIN_DIR"/subspace-*-*
+find "$DESKTOP_DIR" -name 'subspace-*.desktop' -delete 2>/dev/null || true
+
+declare -A plain_claimed
+
+find_binary() {
+    local subspace="$1" name="$2"
+    for dir in "usr/bin" "usr/local/bin" "usr/sbin" "sbin"; do
+        local path="$SUBSPACE_DIR/$subspace/$dir/$name"
+        if [ -x "$path" ]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
+for subspace_dir in "$SUBSPACE_DIR"/*/; do
+    [ -d "$subspace_dir" ] || continue
+    subspace=$(basename "$subspace_dir")
+    [[ "$subspace" == .* ]] && continue
+    [ ! -d "$subspace_dir/usr" ] && continue
+
+    echo "$subspace"
+
+    declare -A binaries
+    for bindir in "usr/bin" "usr/local/bin" "usr/sbin" "sbin"; do
+        [ -d "$subspace_dir/$bindir" ] || continue
+        while IFS= read -r -d '' binary; do
+            app=$(basename "$binary")
+            binaries["$app"]="$binary"
+        done < <(find "$subspace_dir/$bindir" -maxdepth 1 -type f -executable -print0 2>/dev/null)
+    done
+
+    if [ -d "$subspace_dir/usr/share/applications" ]; then
+        while IFS= read -r -d '' desktop; do
+            appname=$(basename "$desktop" .desktop)
+            exec_line=$(grep -m1 '^Exec=' "$desktop" 2>/dev/null || true)
+            [ -z "$exec_line" ] && continue
+
+            exec_cmd=$(echo "$exec_line" | sed 's/^Exec=//' | awk '{print $1}')
+            exec_bin=$(basename "$exec_cmd")
+            [ -z "$exec_bin" ] && continue
+
+            bin_path=""
+            if [ -n "${binaries[$exec_bin]:-}" ]; then
+                bin_path="${binaries[$exec_bin]}"
+            else
+                bin_path=$(find_binary "$subspace" "$exec_bin") || true
+            fi
+            [ -z "$bin_path" ] && continue
+
+            container_path="${bin_path#$subspace_dir}"
+
+            wrapper_name="subspace-${subspace}-${exec_bin}"
+            wrapper_path="$BIN_DIR/$wrapper_name"
+
+            cat > "$wrapper_path" << WRAPPER
+#!/bin/bash
+for term in konsole xterm gnome-terminal kitty alacritty; do
+    if type -p "\$term" &>/dev/null; then
+        exec "\$term" -e bash -c '
+          if type -p doas &>/dev/null; then
+            exec doas /subspace/subspace-run $subspace $container_path "\$@"
+          elif type -p sudo &>/dev/null; then
+            exec sudo /subspace/subspace-run $subspace $container_path "\$@"
+          else
+            exec /subspace/subspace-run $subspace $container_path "\$@"
+          fi
+        ' _ "\$@"
+    fi
+done
+echo "No terminal emulator found" >&2
+exit 1
+WRAPPER
+            chmod +x "$wrapper_path"
+            echo "  wrapper: $wrapper_name"
+
+            desktop_target="$DESKTOP_DIR/subspace-${subspace}-${appname}.desktop"
+            sed \
+                -e "s|^Exec=[^ ]*|Exec=$wrapper_path|" \
+                -e "/^TryExec=/d" \
+                -e "/^Name\[/! s/^Name=\(.*\)/Name=\1 ($subspace)/" \
+                "$desktop" > "$desktop_target"
+            echo "X-Subspace=$subspace" >> "$desktop_target"
+            echo "  desktop: subspace-${subspace}-${appname}.desktop"
+
+            if [ -z "${plain_claimed[$exec_bin]:-}" ]; then
+                if ! command -v "$exec_bin" &>/dev/null; then
+                    plain_claimed["$exec_bin"]="$subspace:$container_path"
+                fi
+            fi
+        done < <(find "$subspace_dir/usr/share/applications" -maxdepth 1 -name '*.desktop' -type f -print0 2>/dev/null)
+    fi
+done
+
+echo "plain wrappers"
+: > "$MANIFEST"
+for bin_name in "${!plain_claimed[@]}"; do
+    IFS=':' read -r subspace container_path <<< "${plain_claimed[$bin_name]}"
+    target="$BIN_DIR/$bin_name"
+    if [ ! -f "$target" ]; then
+        cat > "$target" << WRAPPER
+#!/bin/bash
+for term in konsole xterm gnome-terminal kitty alacritty; do
+    if type -p "\$term" &>/dev/null; then
+        exec "\$term" -e bash -c '
+          if type -p doas &>/dev/null; then
+            exec doas /subspace/subspace-run $subspace $container_path "\$@"
+          elif type -p sudo &>/dev/null; then
+            exec sudo /subspace/subspace-run $subspace $container_path "\$@"
+          else
+            exec /subspace/subspace-run $subspace $container_path "\$@"
+          fi
+        ' _ "\$@"
+    fi
+done
+echo "No terminal emulator found" >&2
+exit 1
+WRAPPER
+        chmod +x "$target"
+        echo "$target" >> "$MANIFEST"
+        echo "  $bin_name -> $subspace"
+    fi
+done
+
+echo "Done."
