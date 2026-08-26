@@ -1,0 +1,79 @@
+#!/bin/bash
+set -euo pipefail
+
+SUBSPACE_DIR="/subspace"
+XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID}"
+
+if [ "$EUID" -ne 0 ]; then
+    echo "This command requires superuser privileges."
+    exit 1
+fi
+
+if [ $# -lt 2 ]; then
+    echo "Usage: subspace-run <subspace> <command> [args...]" >&2
+    echo "" >&2
+    echo "Available subspaces:" >&2
+    for d in "$SUBSPACE_DIR"/*/; do
+        [ -d "$d/usr" ] && echo "  $(basename "$d")" >&2
+    done
+    exit 1
+fi
+
+subspace="$1"
+shift
+root="$SUBSPACE_DIR/$subspace"
+
+if [ ! -d "$root" ]; then
+    echo "Error: Subspace '$subspace' not found at $root" >&2
+    exit 1
+fi
+
+if ! command -v bwrap &>/dev/null; then
+    echo "Error: bubblewrap (bwrap) not found." >&2
+    echo "Install: sudo pacman -S bubblewrap" >&2
+    exit 1
+fi
+
+bwrap_args=(
+    --bind "$root" /
+    --dev-bind /dev /dev
+    --dev-bind /dev/dri /dev/dri
+    --proc /proc
+    --ro-bind /sys /sys
+    --ro-bind /tmp/.X11-unix /tmp/.X11-unix
+    --tmpfs /dev/shm
+    --setenv HOME /root
+    --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    --unshare-ipc
+    --unshare-pid
+    --unshare-uts
+)
+
+if [ -f "$root/etc/resolv.conf" ]; then
+    bwrap_args+=(--ro-bind /etc/resolv.conf /etc/resolv.conf)
+fi
+
+for d in /usr/lib/dri /usr/lib/xorg/modules/dri; do
+    [ -d "$d" ] && bwrap_args+=(--ro-bind "$d" "$d")
+done
+
+
+if [ -n "${DISPLAY:-}" ]; then
+    bwrap_args+=(--setenv DISPLAY "$DISPLAY")
+fi
+
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    wayland_socket="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+    if [ -S "$wayland_socket" ]; then
+        bwrap_args+=(--ro-bind "$wayland_socket" "$wayland_socket")
+        bwrap_args+=(--setenv WAYLAND_DISPLAY "$WAYLAND_DISPLAY")
+        bwrap_args+=(--setenv XDG_RUNTIME_DIR "$XDG_RUNTIME_DIR")
+    fi
+fi
+
+if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+    bwrap_args+=(--ro-bind "$XDG_RUNTIME_DIR/bus" "$XDG_RUNTIME_DIR/bus")
+    bwrap_args+=(--setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$XDG_RUNTIME_DIR/bus")
+fi
+
+exec bwrap "${bwrap_args[@]}" "$@"
