@@ -11,6 +11,7 @@ SUBSPACE_DIR="/subspace"
 SCRIPT_DIR="$(dirname "$0")"
 
 VALID_DISTROS="debian alpine gentoo void fedora opensuse arch"
+DISPOSABLE=0
 
 setup() {
     mkdir -p "$SUBSPACE_DIR"
@@ -28,7 +29,10 @@ setup() {
 }
 
 usage() {
-    echo "Usage: subspace-cli <command> [args]"
+    echo "Usage: subspace-cli [options] <command> [args]"
+    echo
+    echo "Options:"
+    echo "  --disposable    Install, enter, and auto-remove on exit (with install)"
     echo
     echo "Commands:"
     echo "  install <distro>    Install a subspace"
@@ -204,7 +208,7 @@ install_distro() {
 
     echo
     echo "Updating subspace application wrappers..."
-    su - "$REAL_USER" -c "$SUBSPACE_DIR/subspace-sync"
+    "$SUBSPACE_DIR/subspace-sync"
 }
 
 remove_distro() {
@@ -221,7 +225,7 @@ remove_distro() {
     find "$REAL_HOME/.local/share/applications" -name "subspace-${distro}-*.desktop" -delete 2>/dev/null || true
 
     echo "Cleaning up subspace application wrappers..."
-    su - "$REAL_USER" -c "$SUBSPACE_DIR/subspace-sync" 2>/dev/null || true
+    "$SUBSPACE_DIR/subspace-sync" 2>/dev/null || true
     echo "Removal complete."
 }
 
@@ -237,7 +241,30 @@ list_subspaces() {
     fi
 }
 
+cleanup_disposable() {
+    local distro="$1"
+    if [ -d "$SUBSPACE_DIR/$distro" ]; then
+        echo "Removing disposable subspace..."
+        rm -rf "$SUBSPACE_DIR/$distro"
+        rm -f "$SUBSPACE_DIR"/subspace-${distro}-*
+        find "$REAL_HOME/.local/share/applications" -name "subspace-${distro}-*.desktop" -delete 2>/dev/null || true
+        "$SUBSPACE_DIR/subspace-sync" 2>/dev/null || true
+        echo "Disposable subspace removed."
+    fi
+}
+
 # --- main ---
+
+# Parse --disposable flag
+ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--disposable" ]; then
+        DISPOSABLE=1
+    else
+        ARGS+=("$arg")
+    fi
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 setup
 
@@ -253,7 +280,7 @@ case "$command" in
     install)
         if [ $# -lt 1 ]; then
             echo "Error: missing distro name." >&2
-            echo "Usage: subspace-cli install <distro>" >&2
+            echo "Usage: subspace-cli [options] install <distro>" >&2
             exit 1
         fi
         distro="$1"
@@ -262,6 +289,20 @@ case "$command" in
             echo "Valid options: $VALID_DISTROS" >&2
             exit 1
         fi
+
+        if [ "$DISPOSABLE" -eq 1 ]; then
+            if [ -d "$SUBSPACE_DIR/$distro/usr" ]; then
+                echo "Error: '$distro' is already installed. Cannot use --disposable." >&2
+                exit 1
+            fi
+
+            install_distro "$distro"
+            trap "cleanup_disposable '$distro'" EXIT
+
+            "$SUBSPACE_DIR/subspace-enter" "$distro"
+            exit 0
+        fi
+
         install_distro "$distro"
         ;;
     remove)
