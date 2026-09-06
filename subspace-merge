@@ -111,13 +111,13 @@ get_pm_config() {
             PM_CONFIG=()
             PM_USE_BWRAP=1
             PM_POSTHOOK='cat > "/etc/os-release" <<'"'"'EOF'"'"'
-NAME="Zerene OS"
-PRETTY_NAME="Zerene OS (Devbuild 1.1)"
-ID=zerene
-VERSION_CODENAME=mainline
+NAME="Heliade OS"
+PRETTY_NAME="Heliade OS 1.0"
+ID=heliade
+VERSION_CODENAME=savonius
 VERSION="1.0"
-HOME_URL="https://zereneos.org"
-LOGO=zerene
+HOME_URL="https://github.com/gretagen/HeliadeOS"
+LOGO=heliade
 EOF'
             ;;
         opensuse)
