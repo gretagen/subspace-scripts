@@ -75,6 +75,7 @@ install_distro() {
 
             rm -rf "$SUBSPACE_DIR/debian/var/cache/apt/archives/"*
             chown -R "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/debian"
+            subspace-run debian apt upgrade -y
             echo "  > Debian subspace installed at $SUBSPACE_DIR/debian"
             echo "  > Enter with: subspace-enter debian"
             ;;
@@ -94,6 +95,7 @@ install_distro() {
 
             cp /etc/resolv.conf "$SUBSPACE_DIR/alpine/etc/resolv.conf"
             chown -R "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/alpine"
+            subspace-run alpine apk upgrade
             echo "  > Alpine subspace installed at $SUBSPACE_DIR/alpine"
             echo "  > Enter with: subspace-enter alpine"
             ;;
@@ -155,6 +157,7 @@ install_distro() {
 
             cp /etc/resolv.conf "$SUBSPACE_DIR/fedora/etc/resolv.conf"
             chown -R "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/fedora"
+            subspace-run fedora dnf upgrade -y
             echo "  > Fedora subspace installed at $SUBSPACE_DIR/fedora"
             echo "  > Enter with: subspace-enter fedora"
             ;;
@@ -174,6 +177,7 @@ install_distro() {
 
             cp /etc/resolv.conf "$SUBSPACE_DIR/opensuse/etc/resolv.conf"
             chown -R "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/opensuse"
+            subspace-run opensuse zypper --non-interactive dup -l
             echo "  > Opensuse subspace installed at $SUBSPACE_DIR/opensuse"
             echo "  > Enter with: subspace-enter opensuse"
             ;;
