@@ -402,7 +402,7 @@ cmd_merge_package() {
 
     # Create pre-merge generation
     echo "Creating pre-merge generation..."
-    if ! genzee create "pre-merge $distro $pkg"; then
+    if ! chronos create "pre-merge $distro $pkg"; then
         echo "Error: could not create rollback generation. Aborting." >&2
         exit 1
     fi
@@ -414,7 +414,7 @@ cmd_merge_package() {
         run_post_merge_hooks
     else
         echo ""
-        echo "Merge failed. To revert, run: genzee rollback" >&2
+        echo "Merge failed. To revert, run: chronos rollback" >&2
         exit 1
     fi
 }
