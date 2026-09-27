@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SUBSPACE_DIR="/subspace"
+DISPLAY_FILE="/subspace/.display"
 XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID}"
 
 if [ "$EUID" -ne 0 ]; then
@@ -34,6 +35,29 @@ if ! command -v bwrap &>/dev/null; then
     exit 1
 fi
 
+# Read persistent display config if env vars not set
+if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ -f "$DISPLAY_FILE" ]; then
+    saved_display=$(cat "$DISPLAY_FILE" 2>/dev/null || true)
+    if [ -n "$saved_display" ]; then
+        case "$saved_display" in
+            :*)
+                export DISPLAY="$saved_display"
+                ;;
+            wayland-*|wl-*|/run/*)
+                export WAYLAND_DISPLAY="$saved_display"
+                ;;
+            *)
+                # Fallback: treat as X11 display
+                export DISPLAY="$saved_display"
+                ;;
+        esac
+    fi
+fi
+
+# Resolve real user for Xauthority lookup
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+
 bwrap_args=(
     --bind "$root" /
     --dev-bind /dev /dev
@@ -57,11 +81,27 @@ for d in /usr/lib/dri /usr/lib/xorg/modules/dri; do
     [ -d "$d" ] && bwrap_args+=(--ro-bind "$d" "$d")
 done
 
-
+# X11 display support
 if [ -n "${DISPLAY:-}" ]; then
     bwrap_args+=(--setenv DISPLAY "$DISPLAY")
+
+    # Find and bind Xauthority
+    xauth_file=""
+    if [ -n "${XAUTHORITY:-}" ] && [ -f "$XAUTHORITY" ]; then
+        xauth_file="$XAUTHORITY"
+    elif [ -f "$REAL_HOME/.Xauthority" ]; then
+        xauth_file="$REAL_HOME/.Xauthority"
+    elif [ -f "/home/$REAL_USER/.Xauthority" ]; then
+        xauth_file="/home/$REAL_USER/.Xauthority"
+    fi
+
+    if [ -n "$xauth_file" ]; then
+        bwrap_args+=(--ro-bind "$xauth_file" /root/.Xauthority)
+        bwrap_args+=(--setenv XAUTHORITY /root/.Xauthority)
+    fi
 fi
 
+# Wayland display support
 if [ -n "${WAYLAND_DISPLAY:-}" ]; then
     wayland_socket="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
     if [ -S "$wayland_socket" ]; then
@@ -71,6 +111,7 @@ if [ -n "${WAYLAND_DISPLAY:-}" ]; then
     fi
 fi
 
+# D-Bus session support
 if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
     bwrap_args+=(--ro-bind "$XDG_RUNTIME_DIR/bus" "$XDG_RUNTIME_DIR/bus")
     bwrap_args+=(--setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$XDG_RUNTIME_DIR/bus")

@@ -1,0 +1,321 @@
+#!/bin/bash
+set -euo pipefail
+
+# merged-packages-update — update the packages that were merged onto the host
+#
+# Usage:
+#   merged-packages-update <distro>    # update merged packages from one distro
+#   merged-packages-update all         # update merged packages from every subspace
+#   merged-packages-update --pass --no-generation <distro|all>
+#
+# The split is:
+#   subspace  -> the package manager binary and its libraries
+#   host      -> the package manager config, its database, and every file written
+#
+# This command never enters a subspace and never sandboxes anything. Whatever
+# the host's PM database records as installed is, by construction, what was
+# merged onto the host, so a full upgrade is already scoped to the merged set —
+# no manifest is consulted.
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: merged-packages-update requires root privileges." >&2
+    exit 1
+fi
+
+SUBSPACE_DIR="/subspace"
+PASS=0
+NO_GEN=0
+
+VALID_DISTROS="arch debian fedora opensuse void"
+
+usage() {
+    cat <<'EOF'
+Usage: merged-packages-update [options] <distro|all>
+
+Update the packages that were merged onto the host from subspaced distros, by
+running each distro's package manager against the host root. Nothing is
+installed into the subspace.
+
+Commands:
+  merged-packages-update <distro>    Update merged packages from one distro
+  merged-packages-update all         Update merged packages from every
+                                     installed subspace
+
+Options:
+  --pass             Skip the confirmation prompt (for declarative use)
+  --no-generation    Do not create a rollback generation before updating.
+                     Required on a non-btrfs filesystem, where chronos
+                     cannot snapshot at all. Also use when the caller
+                     already creates its own generation.
+
+Merging is optional and experimental. Prefer a native Haliade package wherever
+one exists. Updating can replace host libraries and break the system, which is
+why a rollback generation is taken first unless --no-generation is given.
+
+Supported distros: arch, debian, fedora, opensuse, void
+EOF
+}
+
+# Default yes: an empty answer proceeds.
+confirm() {
+    if [ "$PASS" -eq 1 ]; then return 0; fi
+    read -rp "$1 [Y/n]: " answer
+    case "$answer" in
+        ""|y|Y|yes|Yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# --- Package managers ---
+
+# The baked-in PM binary for a distro, for presence checking.
+pm_binary() {
+    case "$1" in
+        arch)     echo "pacman" ;;
+        debian)   echo "apt-get" ;;
+        fedora)   echo "dnf" ;;
+        opensuse) echo "zypper" ;;
+        void)     echo "xbps-install" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Run a command from a subspace against the host root.
+#
+# Identical to the one in subspace-merge: the subspace's own dynamic loader so
+# the binary finds its own libraries, and the subspace's bin directories
+# prepended to PATH so subprocesses (dnf5's python3, zypper's libexec helpers,
+# scriptlet binaries) resolve to the subspace's copies. No chroot, so config and
+# database stay the host's.
+#
+# A copy rather than a shared library: these are standalone scripts in /usr/bin
+# with no common include path, and the alternative is a new file plus a
+# dependency between two commands that are otherwise independent.
+#
+# Library resolution: the subspace's directories are searched first, then the
+# host's ld.so.cache and /lib//usr/lib as a fallback. A soname the host lacks
+# entirely errors cleanly and names the library to stage; a soname the host has
+# at a different version does not error and fails later at symbol lookup
+# instead. See the longer note in subspace-merge.
+run_pm() {
+    local root="$1"
+    shift
+
+    local ld=""
+    local path
+    for path in \
+        "$root/lib64/ld-linux-x86-64.so.2" \
+        "$root/lib/ld-linux-x86-64.so.2" \
+        "$root/lib/ld-linux.so.2" \
+        "$root/lib64/ld-linux-aarch64.so.1" \
+        "$root/lib/ld-linux-aarch64.so.1"; do
+        if [ -x "$path" ] 2>/dev/null; then
+            ld="$path"
+            break
+        fi
+    done
+
+    local subspace_path="$root/usr/bin:$root/usr/sbin:$root/sbin:$root/bin"
+
+    if [ -n "$ld" ]; then
+        PATH="$subspace_path:$PATH" \
+        HOME="${HOME:-/root}" \
+        "$ld" \
+            --library-path "$root/usr/lib64:$root/usr/lib:$root/usr/lib/x86_64-linux-gnu:$root/lib64:$root/lib" \
+            "$@"
+    else
+        # No loader found. Run it anyway and let it report what is missing.
+        # Plain "$@" and deliberately not "exec": called in a loop, and exec
+        # would replace the whole script.
+        PATH="$subspace_path:$PATH" \
+        HOME="${HOME:-/root}" \
+        "$@"
+    fi
+}
+
+# Run a distro's package manager against the host root.
+#
+# Debian is the odd one out: apt-get upgrade against stale package lists is a
+# no-op, so the metadata refresh has to happen first. Every other distro
+# refreshes implicitly as part of its upgrade. apt-get upgrade (not
+# dist-upgrade) is deliberate — it never installs new dependencies or removes
+# packages, which is the safe choice when merging into a host.
+#
+# Note on scope: these are unscoped upgrades, so they act on everything the
+# host's PM database records as installed. The seeded database deliberately
+# includes each distro's base packages as a resolution oracle, which means
+# those are in scope too. Seed the base as automatically-installed and
+# --userinstalled-style scoping becomes available on debian, fedora, opensuse
+# and void; pacman has no such concept, so arch always needs explicit scoping.
+#
+# Deliberately no pre-flight "is the PM present" check. A missing library
+# should print its own error naming the exact .so to stage, not be swallowed
+# into a "skipped" line.
+pm_update() {
+    local distro="$1"
+    local root="$SUBSPACE_DIR/$distro"
+
+    case "$distro" in
+        arch)     run_pm "$root" "$root/usr/bin/pacman" -Syu --noconfirm ;;
+        debian)   run_pm "$root" /bin/sh -c 'apt-get update -qq && apt-get upgrade -y' ;;
+        fedora)   run_pm "$root" "$root/usr/bin/dnf" upgrade -y --allowerasing ;;
+        opensuse) run_pm "$root" "$root/usr/bin/zypper" --non-interactive update ;;
+        void)     run_pm "$root" "$root/usr/bin/xbps-install" -Syu ;;
+        *) return 1 ;;
+    esac
+}
+
+# --- Rollback generation ---
+
+# One generation for the whole sweep, not one per distro. If a distro's upgrade
+# replaces host libraries and breaks the system, there should be a single
+# rollback point covering the batch, not a stack of them to unwind.
+#
+# Aborts on failure: updating without a rollback point is the one outcome the
+# user cannot recover from. On a non-btrfs filesystem chronos cannot snapshot,
+# hence --no-generation.
+create_generation() {
+    local label="$1"
+
+    if [ "$NO_GEN" -eq 1 ]; then
+        return 0
+    fi
+
+    echo "Creating pre-update generation..."
+    if ! chronos create "pre-update $label"; then
+        echo "Error: could not create rollback generation. Aborting." >&2
+        echo "       On a non-btrfs filesystem this always fails — pass --no-generation" >&2
+        echo "       to update without a rollback point (not recommended on real systems)." >&2
+        exit 1
+    fi
+}
+
+# --- Targets ---
+
+# Populate TARGETS with the distros to update.
+#
+# For 'all', absent subspaces are skipped silently and only the ones actually
+# present are named in the prompt.
+collect_targets() {
+    local want="$1"
+    TARGETS=()
+
+    if [ "$want" = "all" ]; then
+        local dir name
+        for dir in "$SUBSPACE_DIR"/*/; do
+            [ -d "$dir/usr" ] || continue
+            name=$(basename "$dir")
+            # The glob is already sorted, so the prompt reads in a stable order.
+            case " $VALID_DISTROS " in
+                *" $name "*) TARGETS+=("$name") ;;
+            esac
+        done
+
+        if [ "${#TARGETS[@]}" -eq 0 ]; then
+            echo "No installed subspaces found in $SUBSPACE_DIR — nothing to update."
+            exit 0
+        fi
+    else
+        case " $VALID_DISTROS " in
+            *" $want "*) ;;
+            *)
+                echo "Error: unknown distro '$want'." >&2
+                echo "Valid options: $VALID_DISTROS, or 'all'." >&2
+                exit 1
+                ;;
+        esac
+
+        if [ ! -d "$SUBSPACE_DIR/$want/usr" ]; then
+            echo "Error: '$want' subspace not installed at $SUBSPACE_DIR/$want." >&2
+            exit 1
+        fi
+
+        TARGETS=("$want")
+    fi
+}
+
+# Comma-separated list of TARGETS.
+join_targets() {
+    local out="" first=1 d
+    for d in "${TARGETS[@]}"; do
+        if [ "$first" -eq 1 ]; then first=0; else out="$out, "; fi
+        out="$out$d"
+    done
+    printf '%s' "$out"
+}
+
+# --- Main ---
+
+# Parse flags from anywhere in args
+for arg in "$@"; do
+    case "$arg" in
+        --pass) PASS=1 ;;
+        --no-generation) NO_GEN=1 ;;
+    esac
+done
+# Remove the flags so the rest of the parser doesn't see them
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --pass|--no-generation) ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+if [ $# -lt 1 ]; then
+    usage
+    exit 0
+fi
+
+case "$1" in
+    help|-h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+collect_targets "$1"
+
+if ! confirm "Update merged packages from $(join_targets)?"; then
+    echo "Cancelled."
+    exit 0
+fi
+
+create_generation "$(join_targets)"
+
+echo ""
+updated=0
+failed=0
+failed_names=""
+
+for distro in "${TARGETS[@]}"; do
+    pm=$(pm_binary "$distro")
+
+    # No pre-flight check that the PM or its libraries are present. If a library
+    # is missing, the loader prints "error while loading shared libraries:
+    # libalpm.so.13: cannot open shared object file", which names exactly what
+    # to stage. A skip message would throw that away. One distro failing must not
+    # abort the sweep either — the remaining ones still run, so a single sweep
+    # collects every missing library at once.
+    echo "--- $distro: updating merged packages via $pm ---"
+    if pm_update "$distro"; then
+        updated=$((updated + 1))
+    else
+        echo "  $distro: $pm exited non-zero" >&2
+        failed=$((failed + 1))
+        failed_names="$failed_names $distro"
+    fi
+    echo ""
+done
+
+echo "Done: $updated updated, $failed failed."
+if [ -n "$failed_names" ]; then
+    echo "Failed:$failed_names"
+fi
+
+if [ "$failed" -gt 0 ] && [ "$NO_GEN" -eq 0 ]; then
+    echo "To revert everything, run: chronos rollback"
+fi
+
+[ "$failed" -eq 0 ]

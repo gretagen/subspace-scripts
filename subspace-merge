@@ -2,7 +2,18 @@
 set -euo pipefail
 
 # subspace-merge — merge packages from subspaces onto the host system
-# by directly executing the distro's native package manager from the subspace.
+#
+# The split is:
+#   subspace  -> the package manager binary and its libraries
+#   host      -> the package manager config, its database, and every file written
+#
+# The subspace's PM binary is executed through the subspace's own dynamic
+# loader, with PATH pointed at the subspace's binaries so scriptlets and helper
+# binaries resolve to the subspace's copies too. But the filesystem root is
+# never changed, so the PM reads the host's config, uses the host's database and
+# writes to the host. That is what makes a merge behave as though it were
+# happening natively rather than as a copy of files — .desktop files, icons,
+# MIME data and gschemas all land at real paths and ldconfig can see them.
 #
 # Usage:
 #   subspace-merge <distro>                # merge all declared packages
@@ -10,6 +21,7 @@ set -euo pipefail
 #   subspace-merge --list                  # list all merged packages
 #   subspace-merge --list <distro>         # list merged packages for a distro
 #   subspace-merge --pass                  # skip confirmation prompts (declarative)
+#   subspace-merge --no-generation         # skip the pre-merge rollback generation
 
 if [ "$EUID" -ne 0 ]; then
     echo "Merging packages from subspaced distros requires superuser privileges." >&2
@@ -18,14 +30,16 @@ fi
 
 SUBSPACE_DIR="/subspace"
 PASS=0
+NO_GEN=0
+
+SUPPORTED_DISTROS="arch debian fedora opensuse void"
 
 usage() {
     cat <<'EOF'
 Usage: subspace-merge [options] <distro> [package]
 
-Merge packages from a subspace onto the host system using the distro's
-native package manager. The PM binary is executed via the subspace's
-own dynamic linker to ensure library compatibility.
+Merge packages from a subspace onto the host system using the distro's native
+package manager, running against the host root.
 
 Commands:
   subspace-merge <distro>                Merge all declared merged-<distro> packages
@@ -34,9 +48,20 @@ Commands:
   subspace-merge --list <distro>         List merged packages for a specific distro
 
 Options:
-  --pass      Skip confirmation prompts (for declarative use)
+  --pass             Skip confirmation prompts (for declarative use)
+  --no-generation    Do not create a rollback generation before merging.
+                     Use when the caller already creates one (haliade-synchronize
+                     creates a 'post-sync' generation when it finishes).
+                     Also required on a non-btrfs filesystem, where chronos
+                     cannot snapshot at all. Note that it removes the only
+                     thing a bad merge can be undone with.
 
-Supported distros: arch, debian, fedora, opensuse, gentoo
+Merging is optional and experimental. Prefer a native Haliade package wherever
+one exists. A merge can replace host files and break the system, so
+overwriting existing files is permitted and a rollback generation is taken
+first unless --no-generation is given.
+
+Supported distros: arch, debian, fedora, opensuse, void
 Musl distros (alpine) cannot be merged.
 EOF
 }
@@ -47,103 +72,263 @@ confirm() {
     [[ "$answer" =~ ^[Yy]$ ]]
 }
 
-# --- Run PM binary via subspace's dynamic linker ---
-# This ensures the PM finds its own shared libraries from the subspace.
+# --- Rollback generation ---
+# A pre-merge generation is created by default so a bad merge can be reverted
+# with `chronos rollback`. --no-generation suppresses it for callers that
+# already create one themselves (haliade-synchronize makes a 'post-sync'
+# generation when it finishes, so per-package generations would be noise).
+#
+# Aborts on failure: continuing without a rollback point would leave the host
+# in a state the user cannot get back to.
 
+create_generation() {
+    local label="$1"
+
+    if [ "$NO_GEN" -eq 1 ]; then
+        return 0
+    fi
+
+    echo "Creating pre-merge generation..."
+    if ! chronos create "pre-merge $label"; then
+        echo "Error: could not create rollback generation. Aborting." >&2
+        exit 1
+    fi
+}
+
+# --- Package manager access ---
+
+# Run a command from a subspace against the host root.
+#
+# The subspace's dynamic loader is used so the binary resolves its own
+# libraries rather than the host's. Everything else about the host is left
+# alone: no chroot, no bind mount, no private library directory.
+#
+# PATH is prepended with the subspace's bin directories. This matters more than
+# it looks: dnf5 spawns python3, zypper uses /usr/libexec helpers, and rpm and
+# dpkg run scriptlet binaries. Without this they would all resolve against the
+# host and fail, even when the main binary's libraries are all present.
+#
+# Library resolution, measured with LD_DEBUG=libs: the subspace's directories
+# are searched first, and the host's /etc/ld.so.cache plus /lib and /usr/lib are
+# still searched afterwards. So a subspace library wins when present, and the
+# host's is the fallback. Two consequences worth knowing when staging libraries:
+#
+#   - A soname the host lacks entirely produces a clean, actionable error
+#     ("error while loading shared libraries: libalpm.so.13") that names exactly
+#     what to copy across. This is the common case while staging.
+#   - A soname the host has at a *different version* does not error. The host's
+#     copy is used and you get a symbol lookup failure or a crash at runtime
+#     instead, which is much harder to trace back to a merge.
+#
+# There is no way to make the subspace authoritative without a chroot, since
+# ld.so always falls back to the built-in defaults. Precedence is the best
+# available and is the desirable one: the subspace's versions are preferred.
+#
+# The working directory is changed to / before invoking the PM. The PMs assume
+# they were started at the root of the filesystem they are managing, and pacman
+# in particular stats the package's file list as relative paths. Run from a
+# home directory it cannot find any of them, and prints a "could not get file
+# information" warning for every single file in the package.
 run_pm() {
     local root="$1"
     shift
 
-    # Find the subspace's dynamic linker
+    # The subspace's glibc loader.
+    #
+    # Multiarch paths are included because Debian and Ubuntu put the loader at
+    # lib/x86_64-linux-gnu/ rather than lib64/.
     local ld=""
+    local path
     for path in \
         "$root/lib64/ld-linux-x86-64.so.2" \
         "$root/lib/ld-linux-x86-64.so.2" \
         "$root/lib/ld-linux.so.2" \
+        "$root/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" \
         "$root/lib64/ld-linux-aarch64.so.1" \
-        "$root/lib/ld-linux-aarch64.so.1"; do
-        if [ -x "$path" ] 2>/dev/null; then
+        "$root/lib/ld-linux-aarch64.so.1" \
+        "$root/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"; do
+        # -L rejects the absolute symlinks distros use to point at their
+        # loader. Such a link reads "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+        # — a path that resolves against the HOST root, not the subspace, and
+        # on Haliade does not exist. So -x is false for all of them, no loader
+        # is found, and the fallback below runs the binary with the host's own
+        # loader instead — silently defeating the entire mechanism. The real
+        # file is always the multiarch one, which is why it is checked directly.
+        if [ -x "$path" ] && [ ! -L "$path" ]; then
             ld="$path"
             break
         fi
     done
 
+    # Subspace binaries first, so subprocesses find the subspace's copies.
+    local subspace_path="$root/usr/bin:$root/usr/sbin:$root/sbin:$root/bin"
+
     if [ -n "$ld" ]; then
+        cd / || return 1
+        PATH="$subspace_path:$PATH" \
+        HOME="${HOME:-/root}" \
         "$ld" \
             --library-path "$root/usr/lib64:$root/usr/lib:$root/usr/lib/x86_64-linux-gnu:$root/lib64:$root/lib" \
             "$@"
     else
-        # Fallback: try direct execution
-        exec "$@"
+        # No loader found. The binary may be static, or may be missing
+        # libraries. Run it anyway and let it report what is wrong — a
+        # "cannot open shared object file" error names the exact library to
+        # stage, which is far more useful than a silent skip.
+        #
+        # Note this is a plain "$@" and deliberately not "exec": this function
+        # is called in a loop, and exec would replace the whole script.
+        cd / || return 1
+        PATH="$subspace_path:$PATH" \
+        HOME="${HOME:-/root}" \
+        "$@"
     fi
 }
 
-# --- PM configuration per distro ---
-# Each distro defines: binary, install args, remove args, list command, and config prefix args.
-
-get_pm_config() {
+# Install one package onto the host. Returns the package manager's status.
+#
+# Repository and configuration overrides are deliberately absent: the PM reads
+# the host's own config, which already points at the right repositories.
+#
+# Overwriting is allowed unconditionally, and not only for the files the host
+# needs. A merged host has two package systems claiming the same paths, so
+# file conflicts are structural rather than exceptional. Three quarters of a
+# typical conflict list is pre-existing directories that the merged packages
+# merely add files into, and much of the rest are files no host package claims
+# at all — which is a conflict precisely because nothing claims them.
+#
+# The bound on this is worth knowing: overwriting only ever replaces files the
+# package being installed actually ships. Host files outside that set are left
+# alone, so this cannot replace the host userland wholesale.
+#
+# The real safety net is the rollback generation taken beforehand, not this
+# flag. On btrfs a bad merge is reverted with `chronos rollback`; on a non-btrfs
+# filesystem with --no-generation there is nothing behind it, which is why
+# merging is experimental and why the generation is not optional there.
+#
+# --force-overwrite / --allowerasing / --force-resolution are the same idea in
+# each PM's own vocabulary. The host has its own files at these paths, and a
+# transaction that refuses to replace them is exactly the case merging exists
+# to handle.
+pm_install() {
     local distro="$1"
+    local pkg="$2"
     local root="$SUBSPACE_DIR/$distro"
 
-    PM_ROOT="$root"
-    PM_PREHOOK=""
-    PM_POSTHOOK=""
-
     case "$distro" in
-        arch)
-            PM_BIN="merge-arch"
-            PM_INSTALL=()
-            PM_LIST=()
-            PM_CONFIG=()
-            PM_USE_BWRAP=1
-            ;;
-        debian)
-            PM_BIN="merge-debian"
-            PM_INSTALL=()
-            PM_LIST=()
-            PM_CONFIG=()
-            PM_USE_BWRAP=1
-            ;;
-        fedora)
-            PM_BIN="merge-fedora"
-            PM_INSTALL=()
-            PM_LIST=()
-            PM_CONFIG=()
-            PM_USE_BWRAP=1
-            PM_POSTHOOK='cat > "/etc/os-release" <<'"'"'EOF'"'"'
+        # -Sy and not -Syu, deliberately. Upgrading would pull the distro's
+        # entire base set — glibc, coreutils, filesystem — down onto the host
+        # and overwrite the userland that Haliade is built from. A partial
+        # upgrade is the point: refresh the metadata so the target resolves,
+        # then change nothing but the package that was asked for.
+        #
+        # -y is required independently of --noconfirm: an empty database has no
+        # sync metadata at all, and without it the PM reports "database file
+        # for 'core' does not exist" and then "target not found" for the
+        # package it was asked to install.
+        #
+        # -d is the load-bearing flag, and the reason the database is allowed
+        # to exist at all. It installs exactly the package named and resolves
+        # nothing. Against a database seeded with the arch base set, the
+        # resolver would find every base package already installed and skip it
+        # — but that claim is false, because none of their files are on the
+        # host, so the database over-claims and every base-set library is
+        # missing at runtime. Against an empty database the same resolver
+        # instead satisfies every dependency by installing arch's own
+        # glibc, coreutils and filesystem straight over Haliade's userland.
+        # Both seeded and empty are wrong in opposite directions; -d is what
+        # makes the empty case safe, because nothing is resolved.
+        #
+        # The result is a database that contains only packages that were really
+        # merged, each with a real file list. It is a truthful record rather
+        # than an oracle, which is the whole point: it does not claim anything
+        # about the system that is not true, so `pacman -Qq` is the merge
+        # history and tools that read it see reality.
+        #
+        # The cost is that dependencies are not pulled in. A merged binary
+        # will fail with "error while loading shared libraries: libX.so.N" for
+        # each one, and each is fixed by merging that library explicitly. This
+        # converges because every failure names the exact soname to merge.
+        arch)     run_pm "$root" "$root/usr/bin/pacman" --noconfirm -Sy -d \
+                          --overwrite '*' "$pkg" ;;
+        debian)   run_pm "$root" "$root/usr/bin/apt-get" -y --no-install-recommends \
+                          -o Dpkg::Options::=--force-overwrite install "$pkg" ;;
+        fedora)   run_pm "$root" "$root/usr/bin/dnf" install -y --allowerasing \
+                          --setopt=tsflags=nodocs "$pkg" ;;
+        # --replacefiles is the equivalent of --overwrite. --force-resolution
+        # is a different mechanism: it lets the solver choose differently, it
+        # does not permit replacing files another system put there.
+        opensuse) run_pm "$root" "$root/usr/bin/zypper" in -y --force-resolution \
+                          --replacefiles --no-recommends "$pkg" ;;
+        # -f permits replacing existing files. -r / is the root, and -Sy is a
+        # metadata refresh, matching the -y above.
+        void)     run_pm "$root" "$root/usr/bin/xbps-install" -r / -Sy -f "$pkg" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Restore host identity after a transaction that rewrote it.
+#
+# Several distros ship a package that owns /etc/os-release: fedora-release,
+# arch's filesystem and glibc, openSUSE's branding-*. Any of those merged in
+# will overwrite the host's identity, so it is put back afterwards. Cheap
+# insurance, since a wrong ID can change what software on the host thinks it is
+# running on.
+#
+# Shared by subspace-unmerge, which needs it for the same reason: removing one
+# of those packages rewrites os-release just as installing it does.
+
+restore_host_identity() {
+    # Only write when the identity is actually wrong.
+    #
+    # This used to write unconditionally, with a PRETTY_NAME that had drifted
+    # from the one in the rootfs — so every successful merge silently rewrote
+    # os-release even when no package had touched it, leaving the file
+    # permanently one merge behind. Checking first makes this idempotent, which
+    # is the only way a "restore" can be trusted to leave things alone when
+    # there was nothing to restore.
+    if [ -f /etc/os-release ] && grep -qx 'ID=haliade' /etc/os-release; then
+        return 0
+    fi
+
+    # Must match haliade-root/etc/os-release. No zeta package owns that file,
+    # so it is not generated from a manifest and cannot be read back from one —
+    # this literal is the only copy, which is exactly why it drifted once.
+    cat > /etc/os-release <<'EOF'
 NAME="Haliade OS"
-PRETTY_NAME="Haliade OS 1.0"
+PRETTY_NAME="Haliade OS"
 ID=haliade
 VERSION_CODENAME=savonius
 VERSION="1.0"
 HOME_URL="https://github.com/gretagen/HaliadeOS"
 LOGO=haliade
-EOF'
-            ;;
-        opensuse)
-            PM_BIN="merge-opensuse"
-            PM_INSTALL=()
-            PM_LIST=()
-            PM_CONFIG=()
-            PM_USE_BWRAP=1
-            ;;
-        gentoo)
-            echo "Error: gentoo merge not yet supported (requires portage tree + source compilation)." >&2
-            exit 1
-            ;;
-        void)
-            PM_BIN="merge-void"
-            PM_INSTALL=()
-            PM_LIST=()
-            PM_CONFIG=()
-            PM_USE_BWRAP=1
-            ;;
-        *)
-            echo "Error: unsupported distro '$distro'" >&2
-            echo "Supported: arch, debian, fedora, opensuse, gentoo" >&2
-            exit 1
-            ;;
+EOF
+}
+
+pm_postinstall() {
+    local distro="$1"
+
+    case "$distro" in
+        fedora|arch|opensuse) ;;
+        *) return 0 ;;
     esac
+
+    restore_host_identity
+}
+
+# List the packages actually merged onto the host for a distro.
+#
+# This reads the merge manifest, never the package manager's database. The
+# database is only scaffolding so the PM can resolve and record its
+# transactions; its contents are not a promise about what was merged — every
+# distro records dependencies in it, and the seeded-base approach used to
+# populate it with each distro's base set too. The manifest, by contrast, is
+# appended to only on a successful merge and rewritten only on a successful
+# removal, so it is the faithful record of what is really on the host.
+pm_list() {
+    local distro="$1"
+
+    cat "$MANIFEST_DIR/merged-$distro" 2>/dev/null | sort
 }
 
 # --- Validate distro ---
@@ -151,121 +336,21 @@ EOF'
 validate_distro() {
     local distro="$1"
     case "$distro" in
-        arch|debian|fedora|opensuse|gentoo|void) return 0 ;;
+        arch|debian|fedora|opensuse|void) return 0 ;;
         alpine)
             echo "Error: cannot merge '$distro' — musl distro incompatible with glibc host." >&2
             exit 1
             ;;
+        gentoo)
+            echo "Error: cannot merge 'gentoo' — requires a portage tree and source compilation." >&2
+            exit 1
+            ;;
         *)
             echo "Error: unknown distro '$distro'." >&2
-            echo "Supported: arch, debian, fedora, opensuse, gentoo" >&2
+            echo "Supported: arch, debian, fedora, opensuse, void" >&2
             exit 1
             ;;
     esac
-}
-
-# --- Execute PM commands ---
-
-pm_install() {
-    local pkg="$1"
-    get_pm_config "$REPO_DISTRO"
-
-    if [ -n "${PM_PREHOOK:-}" ]; then
-        eval "$PM_PREHOOK"
-    fi
-
-    if [ "${PM_USE_BWRAP:-0}" -eq 1 ]; then
-        # Debian/openSUSE: use merge helper
-        "$PM_BIN" "$pkg"
-        local rc=$?
-    else
-        run_pm "$PM_ROOT" "$PM_BIN" "${PM_CONFIG[@]}" "${PM_INSTALL[@]}" "$pkg"
-        local rc=$?
-    fi
-
-    if [ -n "${PM_POSTHOOK:-}" ]; then
-        eval "$PM_POSTHOOK"
-    fi
-
-    return $rc
-}
-
-pm_list() {
-    get_pm_config "$REPO_DISTRO"
-
-    if [ "${PM_USE_BWRAP:-0}" -eq 1 ]; then
-        # Query package manager inside bwrap
-        ROOT="$PM_ROOT"
-        if [ "$REPO_DISTRO" = "arch" ]; then
-            bwrap \
-                --bind "$ROOT" / \
-                --dev-bind /dev /dev \
-                --proc /proc \
-                --ro-bind /sys /sys \
-                --ro-bind /etc/resolv.conf /etc/resolv.conf \
-                --setenv HOME /root \
-                --unshare-ipc --unshare-pid --unshare-uts \
-                /usr/bin/pacman -Qeq 2>/dev/null | sort || true
-        elif [ "$REPO_DISTRO" = "debian" ]; then
-            bwrap \
-                --bind "$ROOT" / \
-                --dev-bind /dev /dev \
-                --proc /proc \
-                --ro-bind /sys /sys \
-                --ro-bind /etc/resolv.conf /etc/resolv.conf \
-                --setenv HOME /root \
-                --unshare-ipc --unshare-pid --unshare-uts \
-                /usr/bin/dpkg --get-selections 2>/dev/null | grep -v deinstall | awk '{print $1}' || true
-        elif [ "$REPO_DISTRO" = "opensuse" ]; then
-            bwrap \
-                --bind "$ROOT" / \
-                --dev-bind /dev /dev \
-                --proc /proc \
-                --ro-bind /sys /sys \
-                --ro-bind /etc/resolv.conf /etc/resolv.conf \
-                --setenv HOME /root \
-                --unshare-ipc --unshare-pid --unshare-uts \
-                /usr/bin/rpm -qa --qf '%{NAME}\n' 2>/dev/null | sort || true
-        elif [ "$REPO_DISTRO" = "void" ]; then
-            bwrap \
-                --bind "$ROOT" / \
-                --dev-bind /dev /dev \
-                --proc /proc \
-                --ro-bind /sys /sys \
-                --ro-bind /etc/resolv.conf /etc/resolv.conf \
-                --setenv HOME /root \
-                --unshare-ipc --unshare-pid --unshare-uts \
-                /usr/bin/xbps-query -m 2>/dev/null | awk '{print $1}' | sort || true
-        elif [ "$REPO_DISTRO" = "fedora" ]; then
-            bwrap \
-                --bind "$ROOT" / \
-                --dev-bind /dev /dev \
-                --proc /proc \
-                --ro-bind /sys /sys \
-                --ro-bind /etc/resolv.conf /etc/resolv.conf \
-                --setenv HOME /root \
-                --unshare-ipc --unshare-pid --unshare-uts \
-                /usr/bin/dnf repoquery --userinstalled --qf '%{name}\n' 2>/dev/null | sort || true
-        fi
-    else
-        if [ -n "${PM_PREHOOK:-}" ]; then
-            eval "$PM_PREHOOK"
-        fi
-
-        if [ "$REPO_DISTRO" = "gentoo" ]; then
-            run_pm "$PM_ROOT" "$PM_BIN" "${PM_LIST[@]}" 2>/dev/null || true
-        else
-            run_pm "$PM_ROOT" "$PM_BIN" "${PM_CONFIG[@]}" "${PM_LIST[@]}" 2>/dev/null || true
-        fi
-
-        local rc=$?
-
-        if [ -n "${PM_POSTHOOK:-}" ]; then
-            eval "$PM_POSTHOOK"
-        fi
-
-        return $rc
-    fi
 }
 
 # --- List merged packages ---
@@ -280,16 +365,21 @@ cmd_list() {
             exit 1
         fi
         echo "Merged packages from $distro:"
-        REPO_DISTRO="$distro" pm_list || echo "  (none)"
+        pm_list "$distro" || echo "  (none)"
     else
         echo "Merged packages across all distros:"
         for dir in "$SUBSPACE_DIR"/*/; do
             [ -d "$dir/usr" ] || continue
             local d
             d=$(basename "$dir")
-            case "$d" in alpine) continue ;; esac
+            # Skip subspaces that cannot be merged (alpine, gentoo) rather
+            # than aborting the whole listing on them.
+            case " $SUPPORTED_DISTROS " in
+                *" $d "*) ;;
+                *) continue ;;
+            esac
             local pkgs
-            pkgs=$(REPO_DISTRO="$d" pm_list 2>/dev/null || true)
+            pkgs=$(pm_list "$d" 2>/dev/null || true)
             if [ -n "$pkgs" ]; then
                 echo ""
                 echo "  $d:"
@@ -305,10 +395,9 @@ merge_package() {
     local distro="$1"
     local pkg="$2"
 
-    REPO_DISTRO="$distro"
-
     echo "  Installing $pkg via $distro..."
-    if pm_install "$pkg"; then
+    if pm_install "$distro" "$pkg"; then
+        pm_postinstall "$distro"
         return 0
     else
         echo "  Error: failed to install $pkg from $distro." >&2
@@ -356,6 +445,9 @@ cmd_merge_distro() {
         exit 0
     fi
 
+    # One generation for the whole batch, not one per package.
+    create_generation "$distro"
+
     echo "Merging packages from $distro onto host..."
     echo ""
 
@@ -371,9 +463,23 @@ cmd_merge_distro() {
         fi
     done <<< "$pkgs"
 
+    # Refresh caches once for the whole batch, not per package.
+    if [ "$count" -gt 0 ]; then
+        echo ""
+        run_post_merge_hooks
+    fi
+
     echo ""
     if [ "$failed" -gt 0 ]; then
         echo "Done: $count merged, $failed failed."
+        if [ "$NO_GEN" -eq 1 ]; then
+            echo "Some packages failed. No rollback generation was created (--no-generation)." >&2
+        else
+            echo "To revert the successful merges, run: chronos rollback" >&2
+        fi
+        # Non-zero so a declarative caller can tell this batch did not fully
+        # succeed. The individual failures were already reported above.
+        exit 1
     else
         echo "Done: $count package(s) merged from $distro."
     fi
@@ -401,11 +507,7 @@ cmd_merge_package() {
     echo ""
 
     # Create pre-merge generation
-    echo "Creating pre-merge generation..."
-    if ! chronos create "pre-merge $distro $pkg"; then
-        echo "Error: could not create rollback generation. Aborting." >&2
-        exit 1
-    fi
+    create_generation "$distro $pkg"
 
     if merge_package "$distro" "$pkg"; then
         echo ""
@@ -414,7 +516,11 @@ cmd_merge_package() {
         run_post_merge_hooks
     else
         echo ""
-        echo "Merge failed. To revert, run: chronos rollback" >&2
+        if [ "$NO_GEN" -eq 1 ]; then
+            echo "Merge failed. No rollback generation was created (--no-generation)." >&2
+        else
+            echo "Merge failed. To revert, run: chronos rollback" >&2
+        fi
         exit 1
     fi
 }
@@ -452,6 +558,13 @@ manifest_remove() {
 
 run_post_merge_hooks() {
     echo "Running post-merge system updates..."
+
+    # Must come first: newly installed shared libraries have to be in the
+    # linker cache before anything tries to load them.
+    if command -v ldconfig &>/dev/null; then
+        echo "  ldconfig"
+        ldconfig >/dev/null 2>&1 || true
+    fi
 
     if command -v update-desktop-database &>/dev/null; then
         echo "  update-desktop-database"
@@ -492,15 +605,35 @@ run_post_merge_hooks() {
 
 # --- Main ---
 
-# Parse --pass from anywhere in args
+# Reject anything unrecognised before doing any work.
+#
+# This used to be silent, and silent is the worst available outcome: a typo in
+# --no-generation fell through as a stray positional argument, was discarded
+# past the package name, and the merge ran anyway. A misspelled safety flag
+# must be an error, not a no-op.
 for arg in "$@"; do
-    [ "$arg" = "--pass" ] && PASS=1
+    case "$arg" in
+        --pass|--no-generation|--list|-l|--help|-h) ;;
+        -*)
+            echo "Error: unknown option '$arg'" >&2
+            usage
+            exit 1
+            ;;
+    esac
 done
-# Remove --pass from args so the rest of the parser doesn't see it
+
+# Parse flags from anywhere in args
+for arg in "$@"; do
+    case "$arg" in
+        --pass) PASS=1 ;;
+        --no-generation) NO_GEN=1 ;;
+    esac
+done
+# Remove the flags from args so the rest of the parser doesn't see them
 ARGS=()
 for arg in "$@"; do
     case "$arg" in
-        --pass) ;;
+        --pass|--no-generation) ;;
         *) ARGS+=("$arg") ;;
     esac
 done
@@ -514,6 +647,11 @@ fi
 case "$1" in
     --list|-l)
         shift
+        if [ $# -gt 1 ]; then
+            echo "Error: unexpected extra arguments: $*" >&2
+            usage
+            exit 1
+        fi
         cmd_list "${1:-}"
         ;;
     --help|-h)
@@ -531,6 +669,11 @@ case "$1" in
         validate_distro "$distro"
 
         if [ $# -ge 1 ]; then
+            if [ $# -gt 1 ]; then
+                echo "Error: unexpected extra arguments: $*" >&2
+                usage
+                exit 1
+            fi
             # Merge specific package
             cmd_merge_package "$distro" "$1"
         else

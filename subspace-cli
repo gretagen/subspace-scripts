@@ -12,6 +12,8 @@ SCRIPT_DIR="$(dirname "$0")"
 
 VALID_DISTROS="debian alpine gentoo void fedora opensuse arch"
 DISPOSABLE=0
+SET_DISPLAY=""
+DISPLAY_FILE="/subspace/.display"
 
 setup() {
     mkdir -p "$SUBSPACE_DIR"
@@ -32,12 +34,13 @@ usage() {
     echo "Usage: subspace-cli [options] <command> [args]"
     echo
     echo "Options:"
-    echo "  --disposable    Install, enter, and auto-remove on exit (with install)"
+    echo "  --disposable          Install, enter, and auto-remove on exit (with install)"
+    echo "  --setdisplay <display> Set display for GUI support (e.g. :0, wayland-0)"
     echo
     echo "Commands:"
-    echo "  install <distro>    Install a subspace"
-    echo "  remove  <distro>    Remove an installed subspace"
-    echo "  list                List installed subspaces"
+    echo "  install <distro> [distro...]    Install one or more subspaces"
+    echo "  remove  <distro> [distro...]    Remove one or more installed subspaces"
+    echo "  list                            List installed subspaces"
     echo
     echo "Available distros:"
     echo "  debian, alpine, gentoo, void, fedora, opensuse, arch"
@@ -55,28 +58,44 @@ install_distro() {
 
     case "$distro" in
         debian)
-            DEB_ARCH="amd64"
+            # Debian publishes a prebuilt rootfs per arch via debuerreotype.
+            # The <dist>/<suite>/oci/blobs/rootfs.tar.gz path is stable — the
+            # filename never changes on rebuilds, unlike the Fedora OCI path
+            # which pins a hashed blob and breaks when Fedora republishes.
+            #
+            # This is the `base` variant, not `slim`. Both ship the same 88
+            # packages, but slim strips /usr/share down to 6M and leaves zero
+            # locale data and no man pages, which breaks localized apps in the
+            # subspace. base costs 20MB more for 32M of locales.
+            DEB_SUITE="bookworm"
             case "$(uname -m)" in
-                x86_64)  DEB_ARCH="amd64" ;;
-                aarch64) DEB_ARCH="arm64" ;;
-                armv71)  DEB_ARCH="armhf" ;;
-                i686)    DEB_ARCH="i386"  ;;
-                ppc64le) DEB_ARCH="ppc64el" ;;
+                x86_64)     DEB_DIST="dist-amd64"   DEB_ARCH="amd64"   ;;
+                aarch64)    DEB_DIST="dist-arm64v8" DEB_ARCH="arm64"   ;;
+                armv7l)     DEB_DIST="dist-arm32v7" DEB_ARCH="armhf"   ;;
+                i686|i386)  DEB_DIST="dist-i386"    DEB_ARCH="i386"    ;;
+                ppc64le)    DEB_DIST="dist-ppc64le" DEB_ARCH="ppc64el" ;;
+                *) echo "ERROR: no prebuilt Debian rootfs for $(uname -m)"; exit 1 ;;
             esac
 
+            TEMP_DIR=$(mktemp -d)
             mkdir -p "$SUBSPACE_DIR/debian"
-            debootstrap --arch="$DEB_ARCH" stable "$SUBSPACE_DIR/debian" http://deb.debian.org/debian/ || \
-            debootstrap --arch="$DEB_ARCH" --variant=minbase stable "$SUBSPACE_DIR/debian" http://deb.debian.org/debian/
+            curl -fL "https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/$DEB_DIST/$DEB_SUITE/oci/blobs/rootfs.tar.gz" \
+                 -o "$TEMP_DIR/debian.tar.gz"
+            tar -xzf "$TEMP_DIR/debian.tar.gz" -C "$SUBSPACE_DIR/debian"
+            rm -rf "$TEMP_DIR"
 
             if [ ! -d "$SUBSPACE_DIR/debian/usr" ]; then
                 echo "ERROR: Debian subspace installation failed"
                 exit 1
             fi
 
-            rm -rf "$SUBSPACE_DIR/debian/var/cache/apt/archives/"*
+            # subspace-run only binds the host resolver if this file exists
+            # (see subspace-run). Without it the jail has no DNS at all.
+            cp /etc/resolv.conf "$SUBSPACE_DIR/debian/etc/resolv.conf"
             chown -R "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/debian"
+            subspace-run debian apt update -y
             subspace-run debian apt upgrade -y
-            echo "  > Debian subspace installed at $SUBSPACE_DIR/debian"
+            echo "  > Debian subspace installed at $SUBSPACE_DIR/debian ($DEB_ARCH, $DEB_SUITE)"
             echo "  > Enter with: subspace-enter debian"
             ;;
 
@@ -209,10 +228,6 @@ install_distro() {
     esac
 
     find "$SUBSPACE_DIR/$distro" -type f | sed "s|$SUBSPACE_DIR/$distro||" | sort > "$SUBSPACE_DIR/$distro/.snapshot"
-
-    echo
-    echo "Updating subspace application wrappers..."
-    "$SUBSPACE_DIR/subspace-sync"
 }
 
 remove_distro() {
@@ -227,9 +242,6 @@ remove_distro() {
     rm -rf "$SUBSPACE_DIR/$distro"
     rm -f "$SUBSPACE_DIR"/subspace-${distro}-*
     find "$REAL_HOME/.local/share/applications" -name "subspace-${distro}-*.desktop" -delete 2>/dev/null || true
-
-    echo "Cleaning up subspace application wrappers..."
-    "$SUBSPACE_DIR/subspace-sync" 2>/dev/null || true
     echo "Removal complete."
 }
 
@@ -257,18 +269,138 @@ cleanup_disposable() {
     fi
 }
 
+# --- Batch helpers ---
+
+# Validate the distro list: require at least one, reject duplicates and
+# unknown distros. Populates the DISTROS array.
+validate_distros() {
+    local mode="$1"
+    shift
+
+    if [ $# -lt 1 ]; then
+        echo "Error: missing distro name." >&2
+        echo "Usage: subspace-cli [options] $mode <distro> [distro...]" >&2
+        exit 1
+    fi
+
+    DISTROS=()
+    local seen=""
+    for d in "$@"; do
+        if ! echo "$VALID_DISTROS" | grep -qw "$d"; then
+            echo "Error: invalid distro '$d'." >&2
+            echo "Valid options: $VALID_DISTROS" >&2
+            exit 1
+        fi
+        if echo "$seen" | grep -qw "$d"; then
+            echo "Error: duplicate distro '$d'." >&2
+            exit 1
+        fi
+        seen="$seen $d"
+        DISTROS+=("$d")
+    done
+}
+
+# Abort if any requested distro is already installed (for install).
+check_installable() {
+    local name="" first=1 d
+    for d in "${DISTROS[@]}"; do
+        if [ -d "$SUBSPACE_DIR/$d/usr" ]; then
+            if [ $first -eq 1 ]; then first=0; else name="$name, "; fi
+            name="$name'$d'"
+        fi
+    done
+    if [ -n "$name" ]; then
+        echo "Error: already installed: $name" >&2
+        exit 1
+    fi
+}
+
+# Abort if any requested distro is not installed (for remove).
+check_removable() {
+    local name="" first=1 d
+    for d in "${DISTROS[@]}"; do
+        if [ ! -d "$SUBSPACE_DIR/$d" ]; then
+            if [ $first -eq 1 ]; then first=0; else name="$name, "; fi
+            name="$name'$d'"
+        fi
+    done
+    if [ -n "$name" ]; then
+        echo "Error: not installed: $name" >&2
+        exit 1
+    fi
+}
+
+# Comma-separated list of the distros in DISTROS ("" when empty).
+join_distros() {
+    local out="" first=1 d
+    for d in "${DISTROS[@]}"; do
+        if [ $first -eq 1 ]; then first=0; else out="$out, "; fi
+        out="$out$d"
+    done
+    printf '%s' "$out"
+}
+
+# Ask for confirmation before a batch action. Defaults to yes ([Y/n]).
+# Returns 0 to proceed, 1 to abort.
+confirm_batch() {
+    local action="$1"
+    echo "This will $action ${#DISTROS[@]} subspace(s) ($(join_distros))"
+    read -rp "proceed ? [Y/n] " answer
+    case "$answer" in
+        ""|y|Y|yes|Yes|YES)
+            return 0
+            ;;
+        *)
+            echo "Cancelled."
+            return 1
+            ;;
+    esac
+}
+
+# Update subspace application wrappers once after a batch operation.
+sync_wrappers() {
+    echo
+    echo "Updating subspace application wrappers..."
+    "$SUBSPACE_DIR/subspace-sync"
+}
+
 # --- main ---
 
-# Parse --disposable flag
+# Parse flags
 ARGS=()
-for arg in "$@"; do
-    if [ "$arg" = "--disposable" ]; then
-        DISPOSABLE=1
-    else
-        ARGS+=("$arg")
-    fi
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --disposable)
+            DISPOSABLE=1
+            shift
+            ;;
+        --setdisplay)
+            shift
+            SET_DISPLAY="${1:-}"
+            if [ -z "$SET_DISPLAY" ]; then
+                echo "Error: --setdisplay requires a display value (e.g. :0, wayland-0)." >&2
+                exit 1
+            fi
+            shift
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+# Handle --setdisplay
+if [ -n "$SET_DISPLAY" ]; then
+    mkdir -p /subspace
+    echo "$SET_DISPLAY" > "$DISPLAY_FILE"
+    echo "Display set to: $SET_DISPLAY"
+    echo "Config saved to $DISPLAY_FILE"
+    if [ $# -eq 0 ]; then
+        exit 0
+    fi
+fi
 
 setup
 
@@ -282,40 +414,51 @@ shift
 
 case "$command" in
     install)
-        if [ $# -lt 1 ]; then
-            echo "Error: missing distro name." >&2
-            echo "Usage: subspace-cli [options] install <distro>" >&2
-            exit 1
-        fi
-        distro="$1"
-        if ! echo "$VALID_DISTROS" | grep -qw "$distro"; then
-            echo "Error: invalid distro '$distro'." >&2
-            echo "Valid options: $VALID_DISTROS" >&2
-            exit 1
-        fi
+        validate_distros "install" "$@"
+        check_installable
 
         if [ "$DISPOSABLE" -eq 1 ]; then
-            if [ -d "$SUBSPACE_DIR/$distro/usr" ]; then
-                echo "Error: '$distro' is already installed. Cannot use --disposable." >&2
+            if [ "${#DISTROS[@]}" -ne 1 ]; then
+                echo "Error: --disposable can only be used with a single distro." >&2
                 exit 1
             fi
 
+            if ! confirm_batch "install"; then
+                exit 0
+            fi
+
+            distro="${DISTROS[0]}"
             install_distro "$distro"
             trap "cleanup_disposable '$distro'" EXIT
 
+            "$SUBSPACE_DIR/subspace-sync" 2>/dev/null || true
             "$SUBSPACE_DIR/subspace-enter" "$distro"
             exit 0
         fi
 
-        install_distro "$distro"
+        if ! confirm_batch "install"; then
+            exit 0
+        fi
+
+        echo "installing subspace(s)..."
+        for distro in "${DISTROS[@]}"; do
+            install_distro "$distro"
+        done
+        sync_wrappers
         ;;
     remove)
-        if [ $# -lt 1 ]; then
-            echo "Error: missing distro name." >&2
-            echo "Usage: subspace-cli remove <distro>" >&2
-            exit 1
+        validate_distros "remove" "$@"
+        check_removable
+
+        if ! confirm_batch "remove"; then
+            exit 0
         fi
-        remove_distro "$1"
+
+        echo "removing subspace(s)..."
+        for distro in "${DISTROS[@]}"; do
+            remove_distro "$distro"
+        done
+        sync_wrappers
         ;;
     list)
         list_subspaces
