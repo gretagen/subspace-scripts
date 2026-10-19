@@ -10,8 +10,9 @@ REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 SUBSPACE_DIR="/subspace"
 SCRIPT_DIR="$(dirname "$0")"
 
-VALID_DISTROS="debian alpine gentoo void fedora opensuse arch"
+VALID_DISTROS="debian alpine gentoo void fedora opensuse arch nixos"
 DISPOSABLE=0
+PASS=0
 SET_DISPLAY=""
 DISPLAY_FILE="/subspace/.display"
 
@@ -36,6 +37,7 @@ usage() {
     echo "Options:"
     echo "  --disposable          Install, enter, and auto-remove on exit (with install)"
     echo "  --setdisplay <display> Set display for GUI support (e.g. :0, wayland-0)"
+    echo "  --pass                Skip confirmation prompts (for declarative use)"
     echo
     echo "Commands:"
     echo "  install <distro> [distro...]    Install one or more subspaces"
@@ -43,7 +45,7 @@ usage() {
     echo "  list                            List installed subspaces"
     echo
     echo "Available distros:"
-    echo "  debian, alpine, gentoo, void, fedora, opensuse, arch"
+    echo "  debian, alpine, gentoo, void, fedora, opensuse, arch, nixos"
 }
 
 install_distro() {
@@ -225,6 +227,71 @@ install_distro() {
             echo "  > Arch Linux subspace installed at $SUBSPACE_DIR/arch"
             echo "  > Enter with: subspace-enter arch"
             ;;
+
+        nixos)
+            # There is no official NixOS rootfs tarball to download — this is
+            # a real installed system: nixos-install onto a VM disk, first-boot
+            # sanity check, then tar the root out and publish it as a GitHub
+            # release (the same pattern as gretagen/arch-subspace).
+            #
+            # The tarball's contents sit at the top level with no wrapping
+            # directory (./usr, ./nix, ./etc, ...), so extraction takes no
+            # --strip-components. /proc, /sys, /dev, /tmp and /run contents are
+            # excluded, matching what every other rootfs tarball omits.
+            TEMP_DIR=$(mktemp -d)
+            mkdir -p "$SUBSPACE_DIR/nixos"
+            curl -fL "https://github.com/gretagen/nixos-subspace/releases/download/v1.0.0/nixos-rootfs.tar.xz" \
+                 -o "$TEMP_DIR/nixos.tar.xz"
+            tar -xJf "$TEMP_DIR/nixos.tar.xz" -C "$SUBSPACE_DIR/nixos"
+            rm -rf "$TEMP_DIR"
+
+            if [ ! -d "$SUBSPACE_DIR/nixos/usr" ]; then
+                echo "ERROR: NixOS subspace installation failed"
+                exit 1
+            fi
+
+            # Structural proof that this really is an installed NixOS: the
+            # system profile link must be there. Tested with -L and only then
+            # -e because its target is an absolute /nix/store path — from the
+            # host that resolves against the HOST root, where /nix does not
+            # exist, so [ -d ]/[ -e ] alone would always fail (the same trap
+            # as haliade's usr/lib/modules).
+            if [ ! -L "$SUBSPACE_DIR/nixos/nix/var/nix/profiles/system" ] && \
+               [ ! -e "$SUBSPACE_DIR/nixos/nix/var/nix/profiles/system" ]; then
+                echo "ERROR: '$SUBSPACE_DIR/nixos' is not an installed NixOS rootfs"
+                echo "        (nix/var/nix/profiles/system missing)"
+                exit 1
+            fi
+
+            # NixOS ships /etc/resolv.conf as a symlink, usually into
+            # /run/systemd/resolve, which exists only in a booted system. Left
+            # in place, this cp writes through a dangling link and fails — and
+            # worse, subspace-run's "[ -f .../resolv.conf ]" guard then
+            # silently skips the DNS bind, leaving the jail with no name
+            # resolution at all. Replace it with a real file.
+            rm -f "$SUBSPACE_DIR/nixos/etc/resolv.conf"
+            cp /etc/resolv.conf "$SUBSPACE_DIR/nixos/etc/resolv.conf"
+
+            # /run is tmpfs at boot and was excluded from the tarball, taking
+            # /run/current-system with it. Recreate it exactly as boot-time
+            # activation does — pointing at the system profile, which chains
+            # into the store. That restores every /run/current-system/sw/...
+            # path without ever booting NixOS.
+            mkdir -p "$SUBSPACE_DIR/nixos/run"
+            ln -sfn /nix/var/nix/profiles/system "$SUBSPACE_DIR/nixos/run/current-system"
+
+            chown -R "$REAL_USER:$REAL_USER" "$SUBSPACE_DIR/nixos"
+            # Smoke test: nix is part of every NixOS system path, and running
+            # it proves loader, store layout and bwrap mounts all work before
+            # anything else is attempted.
+            if subspace-run nixos /nix/var/nix/profiles/system/sw/bin/nix --version; then
+                echo "  > NixOS subspace installed at $SUBSPACE_DIR/nixos"
+                echo "  > Enter with: subspace-enter nixos"
+            else
+                echo "  > NixOS subspace extracted at $SUBSPACE_DIR/nixos, but the nix smoke test failed"
+                echo "  > Try entering it directly: subspace-enter nixos"
+            fi
+            ;;
     esac
 
     find "$SUBSPACE_DIR/$distro" -type f | sed "s|$SUBSPACE_DIR/$distro||" | sort > "$SUBSPACE_DIR/$distro/.snapshot"
@@ -344,6 +411,7 @@ join_distros() {
 # Returns 0 to proceed, 1 to abort.
 confirm_batch() {
     local action="$1"
+    if [ "$PASS" -eq 1 ]; then return 0; fi
     echo "This will $action ${#DISTROS[@]} subspace(s) ($(join_distros))"
     read -rp "proceed ? [Y/n] " answer
     case "$answer" in
@@ -372,6 +440,10 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --disposable)
             DISPOSABLE=1
+            shift
+            ;;
+        --pass)
+            PASS=1
             shift
             ;;
         --setdisplay)

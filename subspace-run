@@ -31,7 +31,6 @@ fi
 
 if ! command -v bwrap &>/dev/null; then
     echo "Error: bubblewrap (bwrap) not found." >&2
-    echo "Install: sudo pacman -S bubblewrap" >&2
     exit 1
 fi
 
@@ -58,6 +57,26 @@ fi
 REAL_USER="${SUDO_USER:-$USER}"
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 
+# The default PATH below is FHS-shaped, which is right for every distro
+# subspace except one: NixOS keeps its binaries in profile trees
+# (/nix/var/nix/profiles/system/sw/bin and friends) and ships almost nothing
+# in /usr/bin. A NixOS-shaped root therefore gets the profile paths first.
+# Detection is by root shape, not by subspace name.
+#
+# The profiles/system test must be [ -L ]: the link's target is an absolute
+# /nix/store path, and from outside the jail that resolves against the HOST
+# root, where /nix does not exist — [ -d ] and [ -e ] are always false for it
+# (the same trap as haliade's usr/lib/modules). Inside the jail the same path
+# resolves fine, which is why everything below is written in in-jail form.
+run_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+if [ -L "$root/nix/var/nix/profiles/system" ]; then
+    # system path first (systemPackages), then nix's default profile and the
+    # root user's profile (where `nix-env -i` without -p installs land), then
+    # the FHS dirs — /usr/bin/env is genuinely present on NixOS and scripts
+    # depend on it.
+    run_path="/nix/var/nix/profiles/system/sw/bin:/nix/var/nix/profiles/default/bin:/root/.nix-profile/bin:$run_path"
+fi
+
 bwrap_args=(
     --bind "$root" /
     --dev-bind /dev /dev
@@ -67,7 +86,7 @@ bwrap_args=(
     --ro-bind /tmp/.X11-unix /tmp/.X11-unix
     --tmpfs /dev/shm
     --setenv HOME /root
-    --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    --setenv PATH "$run_path"
     --unshare-ipc
     --unshare-pid
     --unshare-uts
@@ -75,6 +94,15 @@ bwrap_args=(
 
 if [ -f "$root/etc/resolv.conf" ]; then
     bwrap_args+=(--ro-bind /etc/resolv.conf /etc/resolv.conf)
+fi
+
+# A NixOS-built nix has the CA bundle path compiled in, but other programs in
+# the jail consult NIX_SSL_CERT_FILE directly (curl, git, python). NixOS ships
+# the bundle at /etc/ssl/certs/ca-bundle.crt — a symlink into the store, hence
+# the [ -L ] test: [ -e ] alone would follow it out of the jail, fail against
+# the host root, and quietly disable HTTPS inside a working NixOS.
+if [ -L "$root/etc/ssl/certs/ca-bundle.crt" ] || [ -e "$root/etc/ssl/certs/ca-bundle.crt" ]; then
+    bwrap_args+=(--setenv NIX_SSL_CERT_FILE /etc/ssl/certs/ca-bundle.crt)
 fi
 
 for d in /usr/lib/dri /usr/lib/xorg/modules/dri; do

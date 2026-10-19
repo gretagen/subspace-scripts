@@ -30,12 +30,56 @@ find "$DESKTOP_DIR" -name 'subspace-*.desktop' -delete 2>/dev/null || true
 
 declare -A plain_claimed
 
+# Resolve a symlink that lives inside a subspace to a host-real path.
+#
+# Subspace symlinks carry in-jail targets: an absolute target like
+# /nix/store/... resolves against the HOST root when tested from outside,
+# where it does not exist, so any walk through the link dies halfway — the
+# usr/lib/modules trap. Each absolute hop is re-rooted under the subspace,
+# each relative hop resolves in place, and short chains (NixOS profiles are
+# two or three hops: profile -> profile-N-link -> store path) are followed
+# until the chain lands on a real file. Prints nothing when it never lands,
+# which is how a profile that does not exist yet is skipped.
+resolve_in_sub() {
+    local sub="$1" p="$2" t hop
+    for hop in 1 2 3 4 5; do
+        [ -L "$p" ] || break
+        t=$(readlink "$p")
+        case "$t" in
+            /*) p="$sub$t" ;;
+            *)  p="$(dirname "$p")/$t" ;;
+        esac
+    done
+    if [ -e "$p" ]; then
+        echo "$p"
+    fi
+}
+
 find_binary() {
     local subspace="$1" name="$2"
+    # Paths are emitted with a doubled separator (…/$subspace//usr/bin/name)
+    # on purpose: container_path is derived by stripping $subspace_dir, which
+    # ends in a slash, and it is that second slash which survives as the
+    # leading slash of the in-jail path. The find-based scan produces the
+    # same shape naturally; emitting single slashes here used to leave
+    # relative paths that bwrap would exec against the wrong directory.
     for dir in "usr/bin" "usr/local/bin" "usr/sbin" "sbin"; do
-        local path="$SUBSPACE_DIR/$subspace/$dir/$name"
+        local path="$SUBSPACE_DIR/$subspace//$dir/$name"
         if [ -x "$path" ]; then
             echo "$path"
+            return 0
+        fi
+    done
+    # NixOS fallback: profile paths cannot be probed host-side (absolute
+    # in-jail symlinks), but store package directories are real on disk, so
+    # the executable can be looked up there directly. Both a versioned
+    # (…-htop-5.0/bin/htop) and a versionless (…-hello/bin/hello) store name
+    # are matched; a glob that matches nothing stays literal and fails -x.
+    local cand
+    for cand in "$SUBSPACE_DIR/$subspace//nix/store/"*-"$name"-*/bin/"$name" \
+                "$SUBSPACE_DIR/$subspace//nix/store/"*-"$name"/bin/"$name"; do
+        if [ -x "$cand" ]; then
+            echo "$cand"
             return 0
         fi
     done
@@ -50,16 +94,74 @@ for subspace_dir in "$SUBSPACE_DIR"/*/; do
 
     echo "$subspace"
 
+    # Where this subspace keeps its commands and .desktop files.
+    #
+    # The FHS directories are always candidates. A NixOS root adds its
+    # profile trees — but those begin with profile symlinks whose targets are
+    # absolute in-jail paths, unresolvable from the host, so each profile is
+    # re-rooted to a host-real directory first (resolve_in_sub). Profiles
+    # that do not exist yet — nothing installed into them — resolve to
+    # nothing and are skipped, which is the normal state of a fresh install.
+    #
+    # declare + explicit reset: `declare -A binaries` alone does NOT empty an
+    # existing map, so entries leaked from the previous subspace in this loop
+    # and a desktop could get pointed at another distro's binary. With two or
+    # more subspaces installed that is guaranteed corruption, which is why
+    # the reset is not optional.
     declare -A binaries
-    for bindir in "usr/bin" "usr/local/bin" "usr/sbin" "sbin"; do
+    binaries=()
+
+    scan_dirs=("usr/bin" "usr/local/bin" "usr/sbin" "sbin")
+    app_dirs=("usr/share/applications")
+
+    if [ -d "$subspace_dir/nix/var/nix/profiles" ]; then
+        for prof in \
+            "$subspace_dir/nix/var/nix/profiles/system" \
+            "$subspace_dir/nix/var/nix/profiles/default" \
+            "$subspace_dir/nix/var/nix/profiles/per-user/root/profile"; do
+            sw=$(resolve_in_sub "$subspace_dir" "$prof")
+            [ -n "$sw" ] || continue
+            # The system profile's binaries live one level deeper (…/sw/bin)
+            # than a user environment's (…/bin), and sw may itself be a store
+            # symlink, so it goes through the same resolution.
+            if [ -L "$sw/sw" ] || [ -e "$sw/sw" ]; then
+                sw=$(resolve_in_sub "$subspace_dir" "$sw/sw")
+                [ -n "$sw" ] || continue
+            fi
+            # Note the "$subspace_dir"/ strip: subspace_dir comes from the
+            # glob and ends in a slash, and sw was built as sub + absolute
+            # target, so sw carries a doubled separator. Stripping through it
+            # leaves a cleanly relative entry (nix/store/...) that combines
+            # with the "$subspace_dir/$bindir" lookups below into the same
+            # doubled-separator shape the FHS dirs have always produced —
+            # and whose strip yields the leading slash of the in-jail path.
+            scan_dirs+=("${sw#"$subspace_dir"/}/bin")
+            app_dirs+=("${sw#"$subspace_dir"/}/share/applications")
+        done
+    fi
+
+    for bindir in "${scan_dirs[@]}"; do
         [ -d "$subspace_dir/$bindir" ] || continue
+        # A regular file must be executable. A symlink is taken as-is: its
+        # target is commonly an absolute /nix/store path that cannot be
+        # stat'd from the host, so -executable would reject every command on
+        # a NixOS profile — the real test happens in-jail at exec time. On
+        # the FHS distros this also starts catching symlinked commands (awk
+        # and friends) that the -type f-only scan silently skipped.
         while IFS= read -r -d '' binary; do
             app=$(basename "$binary")
             binaries["$app"]="$binary"
-        done < <(find "$subspace_dir/$bindir" -maxdepth 1 -type f -executable -print0 2>/dev/null)
+        done < <(find "$subspace_dir/$bindir" -maxdepth 1 \( -type f -executable -o -type l \) -print0 2>/dev/null)
     done
 
-    if [ -d "$subspace_dir/usr/share/applications" ]; then
+    app_paths=()
+    for appdir in "${app_dirs[@]}"; do
+        if [ -d "$subspace_dir/$appdir" ]; then
+            app_paths+=("$subspace_dir/$appdir")
+        fi
+    done
+
+    if [ "${#app_paths[@]}" -gt 0 ]; then
         while IFS= read -r -d '' desktop; do
             appname=$(basename "$desktop" .desktop)
             exec_line=$(grep -m1 '^Exec=' "$desktop" 2>/dev/null || true)
@@ -117,7 +219,7 @@ WRAPPER
                     plain_claimed["$exec_bin"]="$subspace:$container_path"
                 fi
             fi
-        done < <(find "$subspace_dir/usr/share/applications" -maxdepth 1 -name '*.desktop' -type f -print0 2>/dev/null)
+        done < <(find "${app_paths[@]}" -maxdepth 1 -name '*.desktop' -type f -print0 2>/dev/null)
     fi
 done
 

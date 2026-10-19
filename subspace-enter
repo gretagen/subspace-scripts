@@ -37,6 +37,21 @@ else
             break
         fi
     done
+
+    # Fallback for a rootfs where none of the FHS shells materialised — a
+    # NixOS tarball extracted without activation has no /bin/sh yet. The
+    # store's bash is a real directory tree on disk, so unlike profile links
+    # (whose absolute in-jail targets cannot be stat'd from the host — see
+    # subspace-run) it can be tested here; the path handed to subspace-run is
+    # the same store path, resolved in-jail.
+    if [ -z "${shell:-}" ]; then
+        for cand in "$root"/nix/store/*-bash-*/bin/bash "$root"/nix/store/*-bash-*/bin/sh; do
+            if [ -x "$cand" ]; then
+                shell="${cand#"$root"}"
+                break
+            fi
+        done
+    fi
 fi
 
 if [ -z "${shell:-}" ]; then

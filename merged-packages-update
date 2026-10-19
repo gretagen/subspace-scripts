@@ -103,13 +103,23 @@ run_pm() {
 
     local ld=""
     local path
+    # [ ! -L ] as well as [ -x ]: a candidate can be an absolute symlink that
+    # resolves against the *host* root rather than the subspace. The debian
+    # subspace has exactly this — lib64/ld-linux-x86-64.so.2 pointing at
+    # /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 — so the test passes on a
+    # machine that happens to have a loader at that path and the subspace's own
+    # loader is silently never used. Everything downstream then runs against the
+    # wrong libc, which fails much later and much less legibly. See the longer
+    # note in subspace-merge.
     for path in \
         "$root/lib64/ld-linux-x86-64.so.2" \
         "$root/lib/ld-linux-x86-64.so.2" \
         "$root/lib/ld-linux.so.2" \
         "$root/lib64/ld-linux-aarch64.so.1" \
-        "$root/lib/ld-linux-aarch64.so.1"; do
-        if [ -x "$path" ] 2>/dev/null; then
+        "$root/lib/ld-linux-aarch64.so.1" \
+        "$root/usr/lib/ld-linux-x86-64.so.2" \
+        "$root/usr/lib/ld-linux-aarch64.so.1"; do
+        if [ -x "$path" ] 2>/dev/null && [ ! -L "$path" ]; then
             ld="$path"
             break
         fi
@@ -117,17 +127,44 @@ run_pm() {
 
     local subspace_path="$root/usr/bin:$root/usr/sbin:$root/sbin:$root/bin"
 
+    # --library-path is not inherited: it applies only to the loader call
+    # below, while everything the package manager execs — gpg, and every
+    # coreutil reached through the subspace PATH — resolves against the host
+    # loader with no help. LD_LIBRARY_PATH is inherited and is what actually
+    # reaches them. Without it the fedora and opensuse `sed` both die on a
+    # missing libselinux and the void package manager dies on gpg's missing
+    # libz; arch only escapes because its sed needs libraries the host happens
+    # to have.
+    #
+    # Host directories first, on purpose. Subspace-first would put its glibc on
+    # the search path of every host binary, so merging a foreign libc.so.6
+    # would immediately divert Haliade's own processes onto it. Host first lets
+    # the subspace fill in only what the host genuinely lacks. See subspace-merge
+    # for the longer note.
+    local host_libs="/lib64:/lib:/usr/lib64:/usr/lib"
+    local subspace_libs="$root/usr/lib64:$root/usr/lib:$root/usr/lib/x86_64-linux-gnu:$root/lib64:$root/lib"
+    local lib_path="$host_libs:$subspace_libs"
+
+    # cd / in both branches, always. The package manager has to believe it is
+    # operating on the host root: it resolves relative paths, its own prefix and
+    # the paths in the database against the working directory, and every one of
+    # those is wrong from a home directory. This is the single most important
+    # line in the function.
     if [ -n "$ld" ]; then
+        cd / || return 1
         PATH="$subspace_path:$PATH" \
+        LD_LIBRARY_PATH="$lib_path" \
         HOME="${HOME:-/root}" \
         "$ld" \
-            --library-path "$root/usr/lib64:$root/usr/lib:$root/usr/lib/x86_64-linux-gnu:$root/lib64:$root/lib" \
+            --library-path "$subspace_libs" \
             "$@"
     else
         # No loader found. Run it anyway and let it report what is missing.
         # Plain "$@" and deliberately not "exec": called in a loop, and exec
         # would replace the whole script.
+        cd / || return 1
         PATH="$subspace_path:$PATH" \
+        LD_LIBRARY_PATH="$lib_path" \
         HOME="${HOME:-/root}" \
         "$@"
     fi
@@ -142,20 +179,34 @@ run_pm() {
 # packages, which is the safe choice when merging into a host.
 #
 # Note on scope: these are unscoped upgrades, so they act on everything the
-# host's PM database records as installed. The seeded database deliberately
-# includes each distro's base packages as a resolution oracle, which means
-# those are in scope too. Seed the base as automatically-installed and
-# --userinstalled-style scoping becomes available on debian, fedora, opensuse
-# and void; pacman has no such concept, so arch always needs explicit scoping.
+# host's PM database records as installed. That is now exactly the set of
+# packages that were merged, because the database is a truthful record of merges
+# and nothing else — so an upgrade sweep touches the merged set and no part of
+# the host's own userland. This is the reason the database is kept empty rather
+# than seeded, and it is worth being explicit that the two decisions depend on
+# each other: seeding it would put each distro's base packages in scope here.
 #
 # Deliberately no pre-flight "is the PM present" check. A missing library
 # should print its own error naming the exact .so to stage, not be swallowed
 # into a "skipped" line.
+#
+# No --overwrite here, unlike the merge path. A merge is asked to put a package
+# on a host that does not have it, so replacing a file is the only way it can
+# succeed. An upgrade replaces files that are already there, and the correct
+# behaviour when it meets a file the host owns is to stop and say so, not to
+# overwrite Haliade's userland as a side effect of refreshing somebody's htop.
 pm_update() {
     local distro="$1"
     local root="$SUBSPACE_DIR/$distro"
 
     case "$distro" in
+        # -Syu, not -Sy. -u is what makes this an update rather than a no-op, and
+        # it is safe precisely because the database holds only merged packages:
+        # the set of things to upgrade is bounded by what was merged, not by the
+        # distro's base set. Note that -d/-dd is deliberately NOT used here,
+        # unlike the merge path. An upgrade that introduces a new dependency
+        # should install it — the package is being replaced wholesale, and
+        # leaving it broken is not an improvement over the version it replaced.
         arch)     run_pm "$root" "$root/usr/bin/pacman" -Syu --noconfirm ;;
         debian)   run_pm "$root" /bin/sh -c 'apt-get update -qq && apt-get upgrade -y' ;;
         fedora)   run_pm "$root" "$root/usr/bin/dnf" upgrade -y --allowerasing ;;
@@ -216,6 +267,16 @@ collect_targets() {
             exit 0
         fi
     else
+        # nixos is a valid subspace name but has no merge path (nix writes
+        # to /nix/store, never to FHS paths), so it is deliberately absent
+        # from VALID_DISTROS above. Say that explicitly rather than the
+        # "unknown distro" answer its membership in subspace-cli's list would
+        # make misleading.
+        if [ "$want" = "nixos" ]; then
+            echo "Error: 'nixos' cannot be updated — merging Nix packages onto the host is not implemented (sandbox only)." >&2
+            exit 1
+        fi
+
         case " $VALID_DISTROS " in
             *" $want "*) ;;
             *)

@@ -163,12 +163,44 @@ run_pm() {
     # Subspace binaries first, so subprocesses find the subspace's copies.
     local subspace_path="$root/usr/bin:$root/usr/sbin:$root/sbin:$root/bin"
 
+    # The host's own library directories, and the subspace's, in that order.
+    #
+    # --library-path applies to exactly one process: the loader invocation
+    # below. It is not inherited. Everything the package manager goes on to
+    # exec — gpg, and every coreutil reached through the subspace PATH — is a
+    # plain execve that resolves against the host's loader with no help at all.
+    # That is not hypothetical: with the subspace's bin dirs on PATH, the
+    # fedora and opensuse `sed` both resolve to the subspace's copy, and both
+    # need libselinux.so.1, which Haliade does not have, so any pipeline the
+    # script runs dies with "error while loading shared libraries". Arch escaped
+    # this only because its sed needs just libattr and libc, which the host
+    # happens to have — a coincidence of that distro, not a property of the
+    # design. The void package manager fails the same way through gpg, which
+    # needs libz, which Haliade also lacks.
+    #
+    # LD_LIBRARY_PATH is inherited, so it is what actually reaches those
+    # descendants.
+    #
+    # Host first, subspace second, and the order is load-bearing in the
+    # dangerous direction. Putting the subspace first would put *its* glibc on
+    # the host loader's search path for every host binary too, so merging
+    # void's libc.so.6 would immediately start diverting Haliade's own
+    # processes onto void's C library. That is the precise catastrophe this
+    # whole mechanism exists to prevent, and it would be introduced by the
+    # variable meant to prevent its cousin. Host first means host binaries
+    # always find the host's libraries and only genuinely-missing ones — the
+    # subspace's libselinux, its libz — are filled in from the subspace.
+    local host_libs="/lib64:/lib:/usr/lib64:/usr/lib"
+    local subspace_libs="$root/usr/lib64:$root/usr/lib:$root/usr/lib/x86_64-linux-gnu:$root/lib64:$root/lib"
+    local lib_path="$host_libs:$subspace_libs"
+
     if [ -n "$ld" ]; then
         cd / || return 1
         PATH="$subspace_path:$PATH" \
+        LD_LIBRARY_PATH="$lib_path" \
         HOME="${HOME:-/root}" \
         "$ld" \
-            --library-path "$root/usr/lib64:$root/usr/lib:$root/usr/lib/x86_64-linux-gnu:$root/lib64:$root/lib" \
+            --library-path "$subspace_libs" \
             "$@"
     else
         # No loader found. The binary may be static, or may be missing
@@ -180,6 +212,7 @@ run_pm() {
         # is called in a loop, and exec would replace the whole script.
         cd / || return 1
         PATH="$subspace_path:$PATH" \
+        LD_LIBRARY_PATH="$lib_path" \
         HOME="${HOME:-/root}" \
         "$@"
     fi
@@ -210,10 +243,132 @@ run_pm() {
 # each PM's own vocabulary. The host has its own files at these paths, and a
 # transaction that refuses to replace them is exactly the case merging exists
 # to handle.
+# Download one package from the repositories without installing it, and print
+# the path of the file it fetched.
+#
+# This exists because four of the five package managers have no flag that means
+# "install this and resolve nothing", and without that ability they drag the
+# distro's base set in behind the package. Measured on the same package against
+# an empty database:
+#
+#   arch    pacman -dd htop    ->  1 package
+#   fedora  dnf5 install htop  -> 24 packages: glibc-common, glibc-minimal-langpack,
+#                                 glibc-gconv-extra, setup, systemd-libs,
+#                                 ncurses-base, libgcc, pam-libs, ...
+#   void    xbps-install htop  ->  4 packages: glibc-2.41, ncurses-libs, ...
+#
+# Only pacman has the flag. So for the others the transaction is split in two:
+# the resolver is allowed to do what it likes, but its output is only ever
+# *downloaded*; the install is then performed by the low-level installer, which
+# takes a file and resolves nothing.
+#
+# The resolver's choice of what to download is deliberately ignored. It fetches
+# the whole dependency closure, all of which lands in the cache, and the install
+# step names exactly one file out of it. The extra downloads are wasted
+# bandwidth and nothing else.
+#
+# Prints nothing and fails if the package cannot be found or fetched.
+pm_fetch() {
+    local distro="$1"
+    local pkg="$2"
+    local root="$SUBSPACE_DIR/$distro"
+    local cache
+
+    case "$distro" in
+        # --download-only writes into /var/cache/apt/archives, which is the path
+        # the host already has. The alternative, `apt-get download`, writes into
+        # the working directory, and run_pm is required to cd / so that the
+        # package manager believes it is operating on the host root — dropping a
+        # .deb in / to satisfy that is not an acceptable trade.
+        debian)
+            run_pm "$root" "$root/usr/bin/apt-get" -y --no-install-recommends \
+                -o Dpkg::Options::=--force-overwrite \
+                -o Dir::Cache::archives=/var/cache/apt/archives \
+                install --download-only "$pkg" >/dev/null 2>&1 || return 1
+            cache=/var/cache/apt/archives
+            ;;
+        fedora)
+            # Two fedora-specific arguments, both forced by Haliade's identity
+            # rather than by anything about fedora.
+            #
+            # --releasever: the repository files are written in terms of
+            # $releasever, and dnf normally takes that from the host's
+            # os-release. Haliade's os-release deliberately carries no
+            # VERSION_ID — it is Haliade, not a Fedora derivative — so $releasever
+            # resolves to nothing and every repo 404s. Naming the version
+            # explicitly is the only way to read a fedora mirror from a host
+            # that is not fedora.
+            #
+            # --disable-repo=updates: the host's updates repository points at
+            # the path fedora used when 44 shipped, which no longer serves
+            # repodata. The main repository is enough to resolve any package,
+            # and a repository that cannot be read should not fail the merge.
+            #
+            # dnf5 rather than dnf: on current fedora `dnf` is a shim for dnf5,
+            # and calling the shim adds a layer that can pick up a different
+            # plugin set.
+            # --downloadonly goes after the install subcommand: dnf5 rejects it
+            # as a global option, and says so with an "Unknown argument" that
+            # still exits 0, so a misplaced flag fails quietly rather than
+            # loudly.
+            run_pm "$root" "$root/usr/bin/dnf5" -y \
+                --releasever=44 --disable-repo=updates \
+                install --downloadonly "$pkg" \
+                >/dev/null 2>&1 || return 1
+            cache=/var/cache/libdnf5
+            ;;
+        opensuse)
+            run_pm "$root" "$root/usr/bin/zypper" --non-interactive \
+                --download-only install "$pkg" >/dev/null 2>&1 || return 1
+            cache=/var/cache/zypp
+            ;;
+        *) return 1 ;;
+    esac
+
+    # The resolver may have fetched a different version than requested, and on
+    # rpm distros the name alone does not identify the file (htop ships as
+    # htop-3.4.1-3.fc44.x86_64.rpm). Match on the leading name component so a
+    # request for "htop" cannot pick up "htop-vim" or a dependency that happens
+    # to share the prefix.
+    find "$cache" \( -name "${pkg}-*.rpm" -o -name "${pkg}_*.deb" \) 2>/dev/null |
+        sort | tail -1
+}
+
+# Install one already-downloaded package file, resolving no dependencies.
+#
+# --nodeps (rpm) and --force-depends (dpkg) are the load-bearing flags, and each
+# is the real thing rather than a weaker neighbour — the same distinction that
+# makes pacman's -dd necessary rather than -d. Without them, installing a single
+# file still consults the database, finds every dependency unsatisfied, and pulls
+# the closure back in from the repositories.
+#
+# --noscripts on rpm, and no equivalent on dpkg, is a real limitation rather than
+# a choice: a merged package's maintainer scripts run against a host that does
+# not have the distribution they were written for. htop and the libraries this
+# mechanism is used for have none.
+pm_install_file() {
+    local distro="$1"
+    local file="$2"
+    local root="$SUBSPACE_DIR/$distro"
+
+    case "$distro" in
+        fedora|opensuse)
+            run_pm "$root" "$root/usr/bin/rpm" -i --nodeps --replacepkgs \
+                --noscripts "$file"
+            ;;
+        debian)
+            run_pm "$root" "$root/usr/bin/dpkg" -i --force-depends \
+                --force-overwrite "$file"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 pm_install() {
     local distro="$1"
     local pkg="$2"
     local root="$SUBSPACE_DIR/$distro"
+    local file
 
     case "$distro" in
         # -Sy and not -Syu, deliberately. Upgrading would pull the distro's
@@ -227,41 +382,66 @@ pm_install() {
         # for 'core' does not exist" and then "target not found" for the
         # package it was asked to install.
         #
-        # -d is the load-bearing flag, and the reason the database is allowed
-        # to exist at all. It installs exactly the package named and resolves
-        # nothing. Against a database seeded with the arch base set, the
-        # resolver would find every base package already installed and skip it
-        # — but that claim is false, because none of their files are on the
-        # host, so the database over-claims and every base-set library is
-        # missing at runtime. Against an empty database the same resolver
-        # instead satisfies every dependency by installing arch's own
-        # glibc, coreutils and filesystem straight over Haliade's userland.
-        # Both seeded and empty are wrong in opposite directions; -d is what
-        # makes the empty case safe, because nothing is resolved.
+        # -dd is the load-bearing flag, and the reason the database is allowed
+        # to exist at all: it installs exactly the package named and resolves
+        # nothing.
         #
-        # The result is a database that contains only packages that were really
-        # merged, each with a real file list. It is a truthful record rather
-        # than an oracle, which is the whole point: it does not claim anything
-        # about the system that is not true, so `pacman -Qq` is the merge
-        # history and tools that read it see reality.
+        # It has to be -dd and not -d. `pacman -S --help` describes -d as
+        # "skip dependency version checks (-dd to skip all checks)", which is
+        # not a weaker spelling of the same idea — -d suppresses *checks* and
+        # still resolves and installs the entire dependency tree. Measured
+        # against an empty database with `pacman -Sp`:
+        #
+        #   -d  htop  ->  51 packages (glibc, bash, filesystem, ncurses, ...)
+        #   -dd htop  ->   1 package  (htop)
+        #
+        # So the single character between them is the difference between merging
+        # one package and replacing the host userland with arch's. This bit a
+        # live test once already: -d queued 157 MB of arch's base set aimed at
+        # /usr/bin, /usr/lib and /etc, and only two stray directory conflicts
+        # stopped it from committing.
+        #
+        # The database is empty by design rather than seeded, and -dd is what
+        # makes that safe. A seed claiming arch's base set is installed is a
+        # lie — none of those files are on the host — so every base library
+        # goes missing at runtime. An empty database instead invites the
+        # resolver to satisfy every dependency from the repos, which is the
+        # 51-package outcome above. -dd removes the question: nothing is
+        # resolved, so the database's emptiness is never consulted.
+        #
+        # The result is a database containing only packages that were really
+        # merged, each with a real file list. A truthful record rather than an
+        # oracle, which is the whole point: it claims nothing untrue about the
+        # system, so `pacman -Qq` is the merge history and anything reading the
+        # database sees reality.
         #
         # The cost is that dependencies are not pulled in. A merged binary
-        # will fail with "error while loading shared libraries: libX.so.N" for
-        # each one, and each is fixed by merging that library explicitly. This
+        # fails with "error while loading shared libraries: libX.so.N" for each
+        # one, and each is fixed by merging that library by name. This
         # converges because every failure names the exact soname to merge.
-        arch)     run_pm "$root" "$root/usr/bin/pacman" --noconfirm -Sy -d \
+        arch)     run_pm "$root" "$root/usr/bin/pacman" --noconfirm -Sy -dd \
                           --overwrite '*' "$pkg" ;;
-        debian)   run_pm "$root" "$root/usr/bin/apt-get" -y --no-install-recommends \
-                          -o Dpkg::Options::=--force-overwrite install "$pkg" ;;
-        fedora)   run_pm "$root" "$root/usr/bin/dnf" install -y --allowerasing \
-                          --setopt=tsflags=nodocs "$pkg" ;;
-        # --replacefiles is the equivalent of --overwrite. --force-resolution
-        # is a different mechanism: it lets the solver choose differently, it
-        # does not permit replacing files another system put there.
-        opensuse) run_pm "$root" "$root/usr/bin/zypper" in -y --force-resolution \
-                          --replacefiles --no-recommends "$pkg" ;;
+        # The other three have no equivalent of -dd, so they go through the
+        # two-phase path: let the resolver download whatever it wants, then
+        # install exactly one file with an installer that resolves nothing.
+        # Verified end to end on fedora and debian; see pm_fetch and
+        # pm_install_file for what each flag does and does not do.
+        debian|fedora|opensuse)
+            file=$(pm_fetch "$distro" "$pkg")
+            [ -n "$file" ] || return 1
+            pm_install_file "$distro" "$file"
+            ;;
         # -f permits replacing existing files. -r / is the root, and -Sy is a
         # metadata refresh, matching the -y above.
+        #
+        # Unlike the three above, void has nowhere to send this. xbps-install
+        # has no nodeps flag, no equivalent in xbps-uhelper (which offers only
+        # metadata queries and a fetch action), and does not accept a local
+        # package file — it resolves the name against the repository pool and
+        # reports "not found in repository pool" for a path. There is no way to
+        # ask it for one package. The line is left as-is because it is the only
+        # thing xbps can do, and it is known to fetch glibc; see
+        # validate_distro for the warning that says so.
         void)     run_pm "$root" "$root/usr/bin/xbps-install" -r / -Sy -f "$pkg" ;;
         *) return 1 ;;
     esac
@@ -291,18 +471,16 @@ restore_host_identity() {
         return 0
     fi
 
-    # Must match haliade-root/etc/os-release. No zeta package owns that file,
-    # so it is not generated from a manifest and cannot be read back from one —
-    # this literal is the only copy, which is exactly why it drifted once.
-    cat > /etc/os-release <<'EOF'
-NAME="Haliade OS"
-PRETTY_NAME="Haliade OS"
-ID=haliade
-VERSION_CODENAME=savonius
-VERSION="1.0"
-HOME_URL="https://github.com/gretagen/HaliadeOS"
-LOGO=haliade
-EOF
+    # Restored from the shipped factory copy instead of a literal here: this
+    # heredoc drifted from haliade-root/etc/os-release once already, because
+    # nothing tied the two together. /usr/share/factory/ is owned by no distro
+    # release package, so the very package that broke /etc/os-release cannot
+    # rewrite the reference copy either.
+    [ -r /usr/share/factory/os-release ] || {
+        echo "Error: /usr/share/factory/os-release missing; cannot restore host identity." >&2
+        return 1
+    }
+    cat /usr/share/factory/os-release > /etc/os-release
 }
 
 pm_postinstall() {
@@ -343,6 +521,14 @@ validate_distro() {
             ;;
         gentoo)
             echo "Error: cannot merge 'gentoo' — requires a portage tree and source compilation." >&2
+            exit 1
+            ;;
+        nixos)
+            # nixos is a valid subspace name but has no merge path: nix
+            # writes to /nix/store and profile trees, never to the FHS paths
+            # every other distro's merge lands files in. An "unknown distro"
+            # answer would be untrue now, and a silent no-op would be worse.
+            echo "Error: cannot merge 'nixos' — merging Nix packages onto the host is not implemented (sandbox only)." >&2
             exit 1
             ;;
         *)

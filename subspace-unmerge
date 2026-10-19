@@ -149,12 +149,31 @@ run_pm() {
     # Subspace binaries first, so subprocesses find the subspace's copies.
     local subspace_path="$root/usr/bin:$root/usr/sbin:$root/sbin:$root/bin"
 
+    # --library-path is not inherited: it applies only to the loader call
+    # below, while everything the package manager execs — gpg, and every
+    # coreutil reached through the subspace PATH — resolves against the host
+    # loader with no help. LD_LIBRARY_PATH is inherited and is what actually
+    # reaches them. Without it the fedora and opensuse `sed` both die on a
+    # missing libselinux and the void package manager dies on gpg's missing
+    # libz; arch only escapes because its sed needs libraries the host happens
+    # to have.
+    #
+    # Host directories first, on purpose. Subspace-first would put its glibc on
+    # the search path of every host binary, so merging a foreign libc.so.6
+    # would immediately divert Haliade's own processes onto it. Host first lets
+    # the subspace fill in only what the host genuinely lacks. See subspace-merge
+    # for the longer note.
+    local host_libs="/lib64:/lib:/usr/lib64:/usr/lib"
+    local subspace_libs="$root/usr/lib64:$root/usr/lib:$root/usr/lib/x86_64-linux-gnu:$root/lib64:$root/lib"
+    local lib_path="$host_libs:$subspace_libs"
+
     if [ -n "$ld" ]; then
         cd / || return 1
         PATH="$subspace_path:$PATH" \
+        LD_LIBRARY_PATH="$lib_path" \
         HOME="${HOME:-/root}" \
         "$ld" \
-            --library-path "$root/usr/lib64:$root/usr/lib:$root/usr/lib/x86_64-linux-gnu:$root/lib64:$root/lib" \
+            --library-path "$subspace_libs" \
             "$@"
     else
         # No loader found. The binary may be static, or may be missing
@@ -166,6 +185,7 @@ run_pm() {
         # is called in a loop, and exec would replace the whole script.
         cd / || return 1
         PATH="$subspace_path:$PATH" \
+        LD_LIBRARY_PATH="$lib_path" \
         HOME="${HOME:-/root}" \
         "$@"
     fi
@@ -227,22 +247,19 @@ pm_postremove() {
 
     # Idempotent: only writes if the identity is actually wrong. See
     # restore_host_identity in subspace-merge, which this mirrors — the
-    # condition and the copy are deliberately identical so the two cannot
+    # condition and the source are deliberately identical so the two cannot
     # drift apart again the way the PRETTY_NAME did.
     if [ -f /etc/os-release ] && grep -qx 'ID=haliade' /etc/os-release; then
         return 0
     fi
 
-    # Must match haliade-root/etc/os-release.
-    cat > /etc/os-release <<'EOF'
-NAME="Haliade OS"
-PRETTY_NAME="Haliade OS"
-ID=haliade
-VERSION_CODENAME=savonius
-VERSION="1.0"
-HOME_URL="https://github.com/gretagen/HaliadeOS"
-LOGO=haliade
-EOF
+    # Same shipped factory copy subspace-merge restores from; see the comment
+    # there for why it is a file rather than a literal.
+    [ -r /usr/share/factory/os-release ] || {
+        echo "Error: /usr/share/factory/os-release missing; cannot restore host identity." >&2
+        return 1
+    }
+    cat /usr/share/factory/os-release > /etc/os-release
 }
 
 # --- Validate distro ---
@@ -265,6 +282,13 @@ validate_distro() {
             ;;
         gentoo)
             echo "Error: cannot unmerge 'gentoo' — requires a portage tree and source compilation." >&2
+            exit 1
+            ;;
+        nixos)
+            # Valid subspace name, no merge path — see the matching case in
+            # subspace-merge. Nothing was ever merged, so there is nothing
+            # to remove; "unknown distro" would be the wrong answer.
+            echo "Error: cannot unmerge 'nixos' — merging was never implemented for it, so nothing was merged (sandbox only)." >&2
             exit 1
             ;;
         *)
