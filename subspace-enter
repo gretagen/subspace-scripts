@@ -11,6 +11,8 @@ fi
 
 
 if [ $# -lt 1 ]; then
+    echo "subspace-enter | enter an installed subspace" >&2
+    echo "" >&2
     echo "Usage: subspace-enter <subspace> [shell]" >&2
     echo "" >&2
     echo "Available subspaces:" >&2
@@ -38,10 +40,10 @@ else
         fi
     done
 
-    # Fallback for a rootfs where none of the FHS shells materialised — a
+    # Fallback for a rootfs where none of the FHS shells materialised: a
     # NixOS tarball extracted without activation has no /bin/sh yet. The
     # store's bash is a real directory tree on disk, so unlike profile links
-    # (whose absolute in-jail targets cannot be stat'd from the host — see
+    # (whose absolute in-jail targets cannot be stat'd from the host, see
     # subspace-run) it can be tested here; the path handed to subspace-run is
     # the same store path, resolved in-jail.
     if [ -z "${shell:-}" ]; then

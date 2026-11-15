@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# subspace-unmerge — remove packages previously merged from a subspace onto the host
+# subspace-unmerge: remove packages previously merged from a subspace onto the host
 #
 # The mirror image of subspace-merge. The split is the same:
 #   subspace  -> the package manager binary and its libraries
@@ -14,7 +14,7 @@ set -euo pipefail
 #
 # The only thing that differs from merge is the operation. Install resolves a
 # target and writes it; remove resolves an installed package and unwinds it.
-# Everything that made install correct applies here identically — including the
+# Everything that made install correct applies here identically, including the
 # part that matters most for removal, which is that the host's database is the
 # one consulted. Pointing the PM at the subspace's own database instead, as
 # this script used to, makes removal search for packages that were never
@@ -38,6 +38,8 @@ SUPPORTED_DISTROS="arch debian fedora opensuse void"
 
 usage() {
     cat <<'EOF'
+subspace-unmerge | unmerge subspace packages from the host
+
 Usage: subspace-unmerge [options] <distro> <package>
 
 Remove a package previously merged from a subspace onto the host system. The
@@ -48,10 +50,10 @@ against the host.
 Commands:
   subspace-unmerge <distro> <package>   Remove one merged package
 
-Options:
-  --pass             Skip confirmation prompts (for declarative use)
+Flags:
+  --pass             Skip confirmation prompts 
   --no-generation    Do not create a rollback generation before removing.
-                     Use when the caller already creates one (haliade-synchronize
+                     Use when the caller already creates one (nacelle
                      creates a 'post-sync' generation when it finishes).
                      Also required on a non-btrfs filesystem, where chronos
                      cannot snapshot at all. Note that it removes the only
@@ -61,8 +63,13 @@ Unmerging is the inverse of an experimental operation. Prefer a native Haliade
 package wherever one exists, since a merge may have replaced host files that
 other packages now depend on.
 
-Supported distros: arch, debian, fedora, opensuse, void
-Musl distros (alpine) cannot be unmerged, and gentoo is not supported.
+Supported distros: 
+  arch, 
+  debian, 
+  fedora, 
+  opensuse, 
+  void
+Musl distros (alpine) cannot be unmerged, and gentoo and nixos not supported.
 EOF
 }
 
@@ -73,7 +80,7 @@ confirm() {
     [[ "$answer" =~ ^[Yy]$ ]]
 }
 
-# --- Rollback generation ---
+# Rollback generation
 # Removal is destructive, so a pre-remove generation is created by default.
 # --no-generation suppresses it for callers that already create one themselves.
 #
@@ -90,20 +97,20 @@ create_generation() {
     echo "Creating pre-remove generation..."
     if ! chronos create "pre-remove $label"; then
         echo "Error: could not create rollback generation. Aborting." >&2
-        echo "       On a non-btrfs filesystem this always fails — pass --no-generation" >&2
+        echo "       On a non-btrfs filesystem this always fails: pass --no-generation" >&2
         echo "       to unmerge without a rollback point (not recommended on real systems)." >&2
         exit 1
     fi
 }
 
-# --- Package manager access ---
+# Package manager access
 
 # Run a command from a subspace against the host root.
 #
 # Identical to the one in subspace-merge, and for the same reasons. The
 # subspace's loader so the binary resolves its own libraries rather than the
 # host's, and the subspace's bin directories first on PATH so subprocesses
-# resolve to the subspace's copies — zypper uses /usr/libexec helpers and rpm
+# resolve to the subspace's copies: zypper uses /usr/libexec helpers and rpm
 # and dpkg run scriptlet binaries, all of which would otherwise be found
 # against the host and fail.
 #
@@ -135,10 +142,10 @@ run_pm() {
         "$root/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"; do
         # -L rejects the absolute symlinks distros use to point at their
         # loader. Such a link reads "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
-        # — a path that resolves against the HOST root, not the subspace, and
-        # on Haliade does not exist. So -x is false for all of them, no loader
+        # (a path that resolves against the HOST root, not the subspace, and
+        # on Haliade does not exist). So -x is false for all of them, no loader
         # is found, and the fallback below runs the binary with the host's own
-        # loader instead — silently defeating the entire mechanism. The real
+        # loader instead, silently defeating the entire mechanism. The real
         # file is always the multiarch one, which is why it is checked directly.
         if [ -x "$path" ] && [ ! -L "$path" ]; then
             ld="$path"
@@ -150,8 +157,8 @@ run_pm() {
     local subspace_path="$root/usr/bin:$root/usr/sbin:$root/sbin:$root/bin"
 
     # --library-path is not inherited: it applies only to the loader call
-    # below, while everything the package manager execs — gpg, and every
-    # coreutil reached through the subspace PATH — resolves against the host
+    # below, while everything the package manager execs (gpg, and every
+    # coreutil reached through the subspace PATH) resolves against the host
     # loader with no help. LD_LIBRARY_PATH is inherited and is what actually
     # reaches them. Without it the fedora and opensuse `sed` both die on a
     # missing libselinux and the void package manager dies on gpg's missing
@@ -177,7 +184,7 @@ run_pm() {
             "$@"
     else
         # No loader found. The binary may be static, or may be missing
-        # libraries. Run it anyway and let it report what is wrong — a
+        # libraries. Run it anyway and let it report what is wrong: a
         # "cannot open shared object file" error names the exact library to
         # stage, which is far more useful than a silent skip.
         #
@@ -201,13 +208,13 @@ run_pm() {
 # There is deliberately no metadata refresh either, unlike the -Sy that
 # install needs. Removal resolves entirely from the local database, so
 # requiring the repositories would make unmerge fail on a host that is offline
-# or whose mirror is unreachable — the worst possible time to be unable to
+# or whose mirror is unreachable, the worst possible time to be unable to
 # undo something.
 #
 # Removal is bare rather than recursive on the two distros that offer a
 # recursive option. pacman's -Rns and xbps' -R also drop dependencies that
 # nothing else requires, and which dependencies those are is computed entirely
-# from the local database — which on a merged host is a seed claiming the base
+# from the local database, which on a merged host is a seed claiming the base
 # set is installed when its files are not. That is the part of the decision
 # that most trusts a fiction, and the part that can remove packages nobody
 # asked to remove. So each distro removes exactly what was named:
@@ -246,7 +253,7 @@ pm_postremove() {
     esac
 
     # Idempotent: only writes if the identity is actually wrong. See
-    # restore_host_identity in subspace-merge, which this mirrors — the
+    # restore_host_identity in subspace-merge, which this mirrors: the
     # condition and the source are deliberately identical so the two cannot
     # drift apart again the way the PRETTY_NAME did.
     if [ -f /etc/os-release ] && grep -qx 'ID=haliade' /etc/os-release; then
@@ -262,7 +269,7 @@ pm_postremove() {
     cat /usr/share/factory/os-release > /etc/os-release
 }
 
-# --- Validate distro ---
+# Validate distro
 # Mirrors subspace-merge. gentoo is refused here rather than accepted and
 # then rejected later: it used to be accepted by this validator while its
 # package manager branch did not exist, so it failed with a misleading
@@ -277,18 +284,18 @@ validate_distro() {
     esac
     case "$distro" in
         alpine)
-            echo "Error: cannot unmerge '$distro' — musl distro incompatible with glibc host." >&2
+            echo "Error: cannot unmerge '$distro': musl distro incompatible with glibc host." >&2
             exit 1
             ;;
         gentoo)
-            echo "Error: cannot unmerge 'gentoo' — requires a portage tree and source compilation." >&2
+            echo "Error: cannot unmerge 'gentoo': requires a portage tree and source compilation." >&2
             exit 1
             ;;
         nixos)
-            # Valid subspace name, no merge path — see the matching case in
+            # Valid subspace name, no merge path, see the matching case in
             # subspace-merge. Nothing was ever merged, so there is nothing
             # to remove; "unknown distro" would be the wrong answer.
-            echo "Error: cannot unmerge 'nixos' — merging was never implemented for it, so nothing was merged (sandbox only)." >&2
+            echo "Error: cannot unmerge 'nixos': merging was never implemented for it, so nothing was merged (sandbox only)." >&2
             exit 1
             ;;
         *)
@@ -299,7 +306,7 @@ validate_distro() {
     esac
 }
 
-# --- Remove a merged package ---
+# Remove a merged package
 
 cmd_remove() {
     local distro="$1"
@@ -342,7 +349,7 @@ cmd_remove() {
     fi
 }
 
-# --- Manifest management ---
+# Manifest management
 
 MANIFEST_DIR="/var/db"
 
@@ -364,7 +371,7 @@ manifest_remove() {
     fi
 }
 
-# --- Post-merge hooks ---
+# Post-merge hooks
 # Mirrors subspace-merge. Removing a desktop application has to refresh the
 # desktop, icon, MIME, font and schema caches for the same reason installing
 # one does, otherwise the entry lingers after the files behind it are gone.
@@ -416,7 +423,7 @@ run_post_merge_hooks() {
     echo "Post-merge hooks complete."
 }
 
-# --- Main ---
+# Main
 
 # Reject anything unrecognised before doing any work. A typo in a safety flag
 # must be an error, not a silently discarded argument.

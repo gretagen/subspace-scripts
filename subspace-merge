@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# subspace-merge — merge packages from subspaces onto the host system
+# subspace-merge: merge packages from subspaces onto the host system
 #
 # The split is:
 #   subspace  -> the package manager binary and its libraries
@@ -12,7 +12,7 @@ set -euo pipefail
 # binaries resolve to the subspace's copies too. But the filesystem root is
 # never changed, so the PM reads the host's config, uses the host's database and
 # writes to the host. That is what makes a merge behave as though it were
-# happening natively rather than as a copy of files — .desktop files, icons,
+# happening natively rather than as a copy of files: .desktop files, icons,
 # MIME data and gschemas all land at real paths and ldconfig can see them.
 #
 # Usage:
@@ -36,6 +36,24 @@ SUPPORTED_DISTROS="arch debian fedora opensuse void"
 
 usage() {
     cat <<'EOF'
+     ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿
+     ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠛⠋⠁⠀⣿⣷⣦⣤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+     ⣿⣿⣿⣿⣿⡿⠟⠋⠁⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣷⣦⣄⡀⠀⠀⠀⠀⠀
+     ⣿⣿⣿⣏⡁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡷⠆⠀⠀⠀
+     ⣿⣿⡇⠈⠙⠷⣦⣤⣀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⠿⠛⠋⣁⣴⣾⡇⠀⠀
+     ⣿⣿⡇⠀⠀⠀⠀⠈⠙⠻⠶⣤⣄⡀⠀⣿⡿⠟⠛⣉⣠⣴⣾⣿⣿⣿⣿⡇⠀⠀
+     ⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠛⢳ ⣤⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀
+     ⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀
+     ⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀
+     ⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀
+     ⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀
+     ⣿⣿⣧⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠃⠀⠀
+     ⣿⣿⣿⣿⣿⣶⣤⣀⠀⠀⠀⠀⠀⠀⢸⢸⣿⣿⣿⣿⣿⣿⠿⠛⠉⠀⠀⠀⠀⠀
+     ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣦⣤⣀⠀⢸⢸⣿⠿⠛⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀
+     ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣾
+
+subspace-merge | merge subspace packages onto the host
+
 Usage: subspace-merge [options] <distro> [package]
 
 Merge packages from a subspace onto the host system using the distro's native
@@ -47,10 +65,10 @@ Commands:
   subspace-merge --list                  List all merged packages across all distros
   subspace-merge --list <distro>         List merged packages for a specific distro
 
-Options:
+Flags:
   --pass             Skip confirmation prompts (for declarative use)
   --no-generation    Do not create a rollback generation before merging.
-                     Use when the caller already creates one (haliade-synchronize
+                     Use when the caller already creates one (nacelle
                      creates a 'post-sync' generation when it finishes).
                      Also required on a non-btrfs filesystem, where chronos
                      cannot snapshot at all. Note that it removes the only
@@ -72,10 +90,10 @@ confirm() {
     [[ "$answer" =~ ^[Yy]$ ]]
 }
 
-# --- Rollback generation ---
+# Rollback generation
 # A pre-merge generation is created by default so a bad merge can be reverted
 # with `chronos rollback`. --no-generation suppresses it for callers that
-# already create one themselves (haliade-synchronize makes a 'post-sync'
+# already create one themselves (nacelle makes a 'post-sync'
 # generation when it finishes, so per-package generations would be noise).
 #
 # Aborts on failure: continuing without a rollback point would leave the host
@@ -95,7 +113,7 @@ create_generation() {
     fi
 }
 
-# --- Package manager access ---
+# Package manager access
 
 # Run a command from a subspace against the host root.
 #
@@ -149,10 +167,10 @@ run_pm() {
         "$root/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"; do
         # -L rejects the absolute symlinks distros use to point at their
         # loader. Such a link reads "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
-        # — a path that resolves against the HOST root, not the subspace, and
-        # on Haliade does not exist. So -x is false for all of them, no loader
+        # (a path that resolves against the HOST root, not the subspace, and
+        # on Haliade does not exist). So -x is false for all of them, no loader
         # is found, and the fallback below runs the binary with the host's own
-        # loader instead — silently defeating the entire mechanism. The real
+        # loader instead, silently defeating the entire mechanism. The real
         # file is always the multiarch one, which is why it is checked directly.
         if [ -x "$path" ] && [ ! -L "$path" ]; then
             ld="$path"
@@ -167,14 +185,14 @@ run_pm() {
     #
     # --library-path applies to exactly one process: the loader invocation
     # below. It is not inherited. Everything the package manager goes on to
-    # exec — gpg, and every coreutil reached through the subspace PATH — is a
+    # exec (gpg, and every coreutil reached through the subspace PATH) is a
     # plain execve that resolves against the host's loader with no help at all.
     # That is not hypothetical: with the subspace's bin dirs on PATH, the
     # fedora and opensuse `sed` both resolve to the subspace's copy, and both
     # need libselinux.so.1, which Haliade does not have, so any pipeline the
     # script runs dies with "error while loading shared libraries". Arch escaped
     # this only because its sed needs just libattr and libc, which the host
-    # happens to have — a coincidence of that distro, not a property of the
+    # happens to have, a coincidence of that distro, not a property of the
     # design. The void package manager fails the same way through gpg, which
     # needs libz, which Haliade also lacks.
     #
@@ -188,8 +206,8 @@ run_pm() {
     # processes onto void's C library. That is the precise catastrophe this
     # whole mechanism exists to prevent, and it would be introduced by the
     # variable meant to prevent its cousin. Host first means host binaries
-    # always find the host's libraries and only genuinely-missing ones — the
-    # subspace's libselinux, its libz — are filled in from the subspace.
+    # always find the host's libraries and only genuinely-missing ones (the
+    # subspace's libselinux, its libz) are filled in from the subspace.
     local host_libs="/lib64:/lib:/usr/lib64:/usr/lib"
     local subspace_libs="$root/usr/lib64:$root/usr/lib:$root/usr/lib/x86_64-linux-gnu:$root/lib64:$root/lib"
     local lib_path="$host_libs:$subspace_libs"
@@ -204,7 +222,7 @@ run_pm() {
             "$@"
     else
         # No loader found. The binary may be static, or may be missing
-        # libraries. Run it anyway and let it report what is wrong — a
+        # libraries. Run it anyway and let it report what is wrong: a
         # "cannot open shared object file" error names the exact library to
         # stage, which is far more useful than a silent skip.
         #
@@ -228,7 +246,7 @@ run_pm() {
 # file conflicts are structural rather than exceptional. Three quarters of a
 # typical conflict list is pre-existing directories that the merged packages
 # merely add files into, and much of the rest are files no host package claims
-# at all — which is a conflict precisely because nothing claims them.
+# at all, which is a conflict precisely because nothing claims them.
 #
 # The bound on this is worth knowing: overwriting only ever replaces files the
 # package being installed actually ships. Host files outside that set are left
@@ -278,7 +296,7 @@ pm_fetch() {
         # --download-only writes into /var/cache/apt/archives, which is the path
         # the host already has. The alternative, `apt-get download`, writes into
         # the working directory, and run_pm is required to cd / so that the
-        # package manager believes it is operating on the host root — dropping a
+        # package manager believes it is operating on the host root: dropping a
         # .deb in / to satisfy that is not an acceptable trade.
         debian)
             run_pm "$root" "$root/usr/bin/apt-get" -y --no-install-recommends \
@@ -294,7 +312,7 @@ pm_fetch() {
             # --releasever: the repository files are written in terms of
             # $releasever, and dnf normally takes that from the host's
             # os-release. Haliade's os-release deliberately carries no
-            # VERSION_ID — it is Haliade, not a Fedora derivative — so $releasever
+            # VERSION_ID: it is Haliade, not a Fedora derivative, so $releasever
             # resolves to nothing and every repo 404s. Naming the version
             # explicitly is the only way to read a fedora mirror from a host
             # that is not fedora.
@@ -337,7 +355,7 @@ pm_fetch() {
 # Install one already-downloaded package file, resolving no dependencies.
 #
 # --nodeps (rpm) and --force-depends (dpkg) are the load-bearing flags, and each
-# is the real thing rather than a weaker neighbour — the same distinction that
+# is the real thing rather than a weaker neighbour, the same distinction that
 # makes pacman's -dd necessary rather than -d. Without them, installing a single
 # file still consults the database, finds every dependency unsatisfied, and pulls
 # the closure back in from the repositories.
@@ -372,7 +390,7 @@ pm_install() {
 
     case "$distro" in
         # -Sy and not -Syu, deliberately. Upgrading would pull the distro's
-        # entire base set — glibc, coreutils, filesystem — down onto the host
+        # entire base set (glibc, coreutils, filesystem) down onto the host
         # and overwrite the userland that Haliade is built from. A partial
         # upgrade is the point: refresh the metadata so the target resolves,
         # then change nothing but the package that was asked for.
@@ -388,7 +406,7 @@ pm_install() {
         #
         # It has to be -dd and not -d. `pacman -S --help` describes -d as
         # "skip dependency version checks (-dd to skip all checks)", which is
-        # not a weaker spelling of the same idea — -d suppresses *checks* and
+        # not a weaker spelling of the same idea: -d suppresses *checks* and
         # still resolves and installs the entire dependency tree. Measured
         # against an empty database with `pacman -Sp`:
         #
@@ -403,7 +421,7 @@ pm_install() {
         #
         # The database is empty by design rather than seeded, and -dd is what
         # makes that safe. A seed claiming arch's base set is installed is a
-        # lie — none of those files are on the host — so every base library
+        # lie (none of those files are on the host), so every base library
         # goes missing at runtime. An empty database instead invites the
         # resolver to satisfy every dependency from the repos, which is the
         # 51-package outcome above. -dd removes the question: nothing is
@@ -437,7 +455,7 @@ pm_install() {
         # Unlike the three above, void has nowhere to send this. xbps-install
         # has no nodeps flag, no equivalent in xbps-uhelper (which offers only
         # metadata queries and a fetch action), and does not accept a local
-        # package file — it resolves the name against the repository pool and
+        # package file: it resolves the name against the repository pool and
         # reports "not found in repository pool" for a path. There is no way to
         # ask it for one package. The line is left as-is because it is the only
         # thing xbps can do, and it is known to fetch glibc; see
@@ -462,7 +480,7 @@ restore_host_identity() {
     # Only write when the identity is actually wrong.
     #
     # This used to write unconditionally, with a PRETTY_NAME that had drifted
-    # from the one in the rootfs — so every successful merge silently rewrote
+    # from the one in the rootfs, so every successful merge silently rewrote
     # os-release even when no package had touched it, leaving the file
     # permanently one merge behind. Checking first makes this idempotent, which
     # is the only way a "restore" can be trusted to leave things alone when
@@ -498,7 +516,7 @@ pm_postinstall() {
 #
 # This reads the merge manifest, never the package manager's database. The
 # database is only scaffolding so the PM can resolve and record its
-# transactions; its contents are not a promise about what was merged — every
+# transactions; its contents are not a promise about what was merged: every
 # distro records dependencies in it, and the seeded-base approach used to
 # populate it with each distro's base set too. The manifest, by contrast, is
 # appended to only on a successful merge and rewritten only on a successful
@@ -509,18 +527,18 @@ pm_list() {
     cat "$MANIFEST_DIR/merged-$distro" 2>/dev/null | sort
 }
 
-# --- Validate distro ---
+# Validate distro
 
 validate_distro() {
     local distro="$1"
     case "$distro" in
         arch|debian|fedora|opensuse|void) return 0 ;;
         alpine)
-            echo "Error: cannot merge '$distro' — musl distro incompatible with glibc host." >&2
+            echo "Error: cannot merge '$distro': musl distro incompatible with glibc host." >&2
             exit 1
             ;;
         gentoo)
-            echo "Error: cannot merge 'gentoo' — requires a portage tree and source compilation." >&2
+            echo "Error: cannot merge 'gentoo': requires a portage tree and source compilation." >&2
             exit 1
             ;;
         nixos)
@@ -528,7 +546,7 @@ validate_distro() {
             # writes to /nix/store and profile trees, never to the FHS paths
             # every other distro's merge lands files in. An "unknown distro"
             # answer would be untrue now, and a silent no-op would be worse.
-            echo "Error: cannot merge 'nixos' — merging Nix packages onto the host is not implemented (sandbox only)." >&2
+            echo "Error: cannot merge 'nixos': merging Nix packages onto the host is not implemented (sandbox only)." >&2
             exit 1
             ;;
         *)
@@ -539,7 +557,7 @@ validate_distro() {
     esac
 }
 
-# --- List merged packages ---
+# List merged packages
 
 cmd_list() {
     local distro="${1:-}"
@@ -575,7 +593,7 @@ cmd_list() {
     fi
 }
 
-# --- Merge a single package ---
+# Merge a single package
 
 merge_package() {
     local distro="$1"
@@ -591,7 +609,7 @@ merge_package() {
     fi
 }
 
-# --- Merge all declared packages for a distro ---
+# Merge all declared packages for a distro
 
 cmd_merge_distro() {
     local distro="$1"
@@ -671,7 +689,7 @@ cmd_merge_distro() {
     fi
 }
 
-# --- Merge a specific package (ad-hoc) ---
+# Merge a specific package (ad-hoc)
 
 cmd_merge_package() {
     local distro="$1"
@@ -711,7 +729,7 @@ cmd_merge_package() {
     fi
 }
 
-# --- Manifest management ---
+# Manifest management
 
 MANIFEST_DIR="/var/db"
 
@@ -740,7 +758,7 @@ manifest_remove() {
     fi
 }
 
-# --- Post-merge hooks ---
+# Post-merge hooks
 
 run_post_merge_hooks() {
     echo "Running post-merge system updates..."
@@ -789,7 +807,7 @@ run_post_merge_hooks() {
     echo "Post-merge hooks complete."
 }
 
-# --- Main ---
+# Main
 
 # Reject anything unrecognised before doing any work.
 #
