@@ -34,7 +34,7 @@ declare -A plain_claimed
 #
 # Subspace symlinks carry in-jail targets: an absolute target like
 # /nix/store/... resolves against the HOST root when tested from outside,
-# where it does not exist, so any walk through the link dies halfway — the
+# where it does not exist, so any walk through the link dies halfway: the
 # usr/lib/modules trap. Each absolute hop is re-rooted under the subspace,
 # each relative hop resolves in place, and short chains (NixOS profiles are
 # two or three hops: profile -> profile-N-link -> store path) are followed
@@ -97,10 +97,10 @@ for subspace_dir in "$SUBSPACE_DIR"/*/; do
     # Where this subspace keeps its commands and .desktop files.
     #
     # The FHS directories are always candidates. A NixOS root adds its
-    # profile trees — but those begin with profile symlinks whose targets are
+    # profile trees, but those begin with profile symlinks whose targets are
     # absolute in-jail paths, unresolvable from the host, so each profile is
     # re-rooted to a host-real directory first (resolve_in_sub). Profiles
-    # that do not exist yet — nothing installed into them — resolve to
+    # that do not exist yet (nothing installed into them) resolve to
     # nothing and are skipped, which is the normal state of a fresh install.
     #
     # declare + explicit reset: `declare -A binaries` alone does NOT empty an
@@ -133,7 +133,7 @@ for subspace_dir in "$SUBSPACE_DIR"/*/; do
             # target, so sw carries a doubled separator. Stripping through it
             # leaves a cleanly relative entry (nix/store/...) that combines
             # with the "$subspace_dir/$bindir" lookups below into the same
-            # doubled-separator shape the FHS dirs have always produced —
+            # doubled-separator shape the FHS dirs have always produced,
             # and whose strip yields the leading slash of the in-jail path.
             scan_dirs+=("${sw#"$subspace_dir"/}/bin")
             app_dirs+=("${sw#"$subspace_dir"/}/share/applications")
@@ -145,7 +145,7 @@ for subspace_dir in "$SUBSPACE_DIR"/*/; do
         # A regular file must be executable. A symlink is taken as-is: its
         # target is commonly an absolute /nix/store path that cannot be
         # stat'd from the host, so -executable would reject every command on
-        # a NixOS profile — the real test happens in-jail at exec time. On
+        # a NixOS profile: the real test happens in-jail at exec time. On
         # the FHS distros this also starts catching symlinked commands (awk
         # and friends) that the -type f-only scan silently skipped.
         while IFS= read -r -d '' binary; do

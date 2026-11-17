@@ -32,20 +32,46 @@ setup() {
 }
 
 usage() {
-    echo "Usage: subspace-cli [options] <command> [args]"
-    echo
-    echo "Options:"
-    echo "  --disposable          Install, enter, and auto-remove on exit (with install)"
-    echo "  --setdisplay <display> Set display for GUI support (e.g. :0, wayland-0)"
-    echo "  --pass                Skip confirmation prompts (for declarative use)"
-    echo
-    echo "Commands:"
-    echo "  install <distro> [distro...]    Install one or more subspaces"
-    echo "  remove  <distro> [distro...]    Remove one or more installed subspaces"
-    echo "  list                            List installed subspaces"
-    echo
-    echo "Available distros:"
-    echo "  debian, alpine, gentoo, void, fedora, opensuse, arch, nixos"
+    cat << 'EOF'
+     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣤⣴⣾⣿⣿⣷⣦⣤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+     ⠀⠀⠀⠀⠀⢀⣠⣴⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣦⣄⡀⠀⠀⠀⠀⠀
+     ⠀⠀⠀⠰⢾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡷⠆⠀⠀⠀
+     ⠀⠀⢸⣷⣦⣈⠙⠛⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠛⠋⣁⣴⣾⡇⠀⠀
+     ⠀⠀⢸⣿⣿⣿⣿⣷⣦⣄⣉⠛⠻⢿⣿⣿⡿⠟⠛⣉⣠⣴⣾⣿⣿⣿⣿⡇⠀⠀
+     ⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣤⡌⢡⣤⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀
+     ⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀
+     ⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀
+     ⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀
+     ⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀
+     ⠀⠀⠘⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠃⠀⠀
+    ⠀ ⠀⠀⠀⠀⠉⠛⠿⣿⣿⣿⣿⣿⣿⡇⢸⣿⣿⣿⣿⣿⣿⠿⠛⠉⠀⠀⠀⠀⠀
+   ⠀ ⠀ ⠀⠀⠀⠀⠀⠀⠀⠈⠙⠛⠿⣿⡇⢸⣿⠿⠛⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀
+
+subspace-cli | manage isolated distro subspaces
+
+Usage: subspace-cli [options] <command> [args]
+
+Commands:
+  install <distro> [distro...]    Install one or more subspaces
+  remove  <distro> [distro...]    Remove one or more installed subspaces
+  list                            List installed subspaces
+
+Flags:
+  --disposable                    Install, enter, and auto-remove on exit (with install)
+  --setdisplay <display>          Set display for GUI support (e.g. :0, wayland-0)
+  --pass                          Skip confirmation prompt
+
+Available distros:
+  debian 
+  alpine 
+  gentoo 
+  void 
+  fedora 
+  opensuse 
+  arch
+  nixos
+EOF
 }
 
 install_distro() {
@@ -61,7 +87,7 @@ install_distro() {
     case "$distro" in
         debian)
             # Debian publishes a prebuilt rootfs per arch via debuerreotype.
-            # The <dist>/<suite>/oci/blobs/rootfs.tar.gz path is stable — the
+            # The <dist>/<suite>/oci/blobs/rootfs.tar.gz path is stable: the
             # filename never changes on rebuilds, unlike the Fedora OCI path
             # which pins a hashed blob and breaks when Fedora republishes.
             #
@@ -229,7 +255,7 @@ install_distro() {
             ;;
 
         nixos)
-            # There is no official NixOS rootfs tarball to download — this is
+            # There is no official NixOS rootfs tarball to download: this is
             # a real installed system: nixos-install onto a VM disk, first-boot
             # sanity check, then tar the root out and publish it as a GitHub
             # release (the same pattern as gretagen/arch-subspace).
@@ -252,7 +278,7 @@ install_distro() {
 
             # Structural proof that this really is an installed NixOS: the
             # system profile link must be there. Tested with -L and only then
-            # -e because its target is an absolute /nix/store path — from the
+            # -e because its target is an absolute /nix/store path, from the
             # host that resolves against the HOST root, where /nix does not
             # exist, so [ -d ]/[ -e ] alone would always fail (the same trap
             # as haliade's usr/lib/modules).
@@ -265,7 +291,7 @@ install_distro() {
 
             # NixOS ships /etc/resolv.conf as a symlink, usually into
             # /run/systemd/resolve, which exists only in a booted system. Left
-            # in place, this cp writes through a dangling link and fails — and
+            # in place, this cp writes through a dangling link and fails, and
             # worse, subspace-run's "[ -f .../resolv.conf ]" guard then
             # silently skips the DNS bind, leaving the jail with no name
             # resolution at all. Replace it with a real file.
@@ -274,7 +300,7 @@ install_distro() {
 
             # /run is tmpfs at boot and was excluded from the tarball, taking
             # /run/current-system with it. Recreate it exactly as boot-time
-            # activation does — pointing at the system profile, which chains
+            # activation does, pointing at the system profile, which chains
             # into the store. That restores every /run/current-system/sw/...
             # path without ever booting NixOS.
             mkdir -p "$SUBSPACE_DIR/nixos/run"
@@ -336,7 +362,7 @@ cleanup_disposable() {
     fi
 }
 
-# --- Batch helpers ---
+# Batch helpers
 
 # Validate the distro list: require at least one, reject duplicates and
 # unknown distros. Populates the DISTROS array.
@@ -432,7 +458,7 @@ sync_wrappers() {
     "$SUBSPACE_DIR/subspace-sync"
 }
 
-# --- main ---
+# main
 
 # Parse flags
 ARGS=()

@@ -11,6 +11,8 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 if [ $# -lt 2 ]; then
+    echo "subspace-run | run a command inside a subspace" >&2
+    echo "" >&2
     echo "Usage: subspace-run <subspace> <command> [args...]" >&2
     echo "" >&2
     echo "Available subspaces:" >&2
@@ -65,14 +67,14 @@ REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 #
 # The profiles/system test must be [ -L ]: the link's target is an absolute
 # /nix/store path, and from outside the jail that resolves against the HOST
-# root, where /nix does not exist — [ -d ] and [ -e ] are always false for it
+# root, where /nix does not exist: [ -d ] and [ -e ] are always false for it
 # (the same trap as haliade's usr/lib/modules). Inside the jail the same path
 # resolves fine, which is why everything below is written in in-jail form.
 run_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 if [ -L "$root/nix/var/nix/profiles/system" ]; then
     # system path first (systemPackages), then nix's default profile and the
     # root user's profile (where `nix-env -i` without -p installs land), then
-    # the FHS dirs — /usr/bin/env is genuinely present on NixOS and scripts
+    # the FHS dirs: /usr/bin/env is genuinely present on NixOS and scripts
     # depend on it.
     run_path="/nix/var/nix/profiles/system/sw/bin:/nix/var/nix/profiles/default/bin:/root/.nix-profile/bin:$run_path"
 fi
@@ -98,7 +100,7 @@ fi
 
 # A NixOS-built nix has the CA bundle path compiled in, but other programs in
 # the jail consult NIX_SSL_CERT_FILE directly (curl, git, python). NixOS ships
-# the bundle at /etc/ssl/certs/ca-bundle.crt — a symlink into the store, hence
+# the bundle at /etc/ssl/certs/ca-bundle.crt: a symlink into the store, hence
 # the [ -L ] test: [ -e ] alone would follow it out of the jail, fail against
 # the host root, and quietly disable HTTPS inside a working NixOS.
 if [ -L "$root/etc/ssl/certs/ca-bundle.crt" ] || [ -e "$root/etc/ssl/certs/ca-bundle.crt" ]; then
